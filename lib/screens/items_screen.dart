@@ -124,6 +124,7 @@ class _ItemsScreenState extends State<ItemsScreen> {
     }
   }
 
+  //standard page layout for loading, error and empty state
   Widget _buildScaffoldShell({
     required Widget body,
     bool showBottomNav = false,
@@ -157,6 +158,7 @@ class _ItemsScreenState extends State<ItemsScreen> {
     );
   }
 
+  //builds a centered message screen
   Widget _buildCenteredState({
     required IconData icon,
     required String title,
@@ -288,6 +290,7 @@ class _ItemsScreenState extends State<ItemsScreen> {
   }
 }
 
+//represents the result of bootstrap loading
 class _ItemsBootstrapState {
   final String? tenantId;
   final String role;
@@ -345,6 +348,7 @@ class _ItemsBootstrapState {
   bool get isReady => tenantId != null && tenantId!.trim().isNotEmpty;
 }
 
+//actual working screen
 class _ItemsContent extends StatefulWidget {
   final String tenantId;
   final String folderId;
@@ -365,14 +369,8 @@ class _ItemsContent extends StatefulWidget {
 
 class _ItemsContentState extends State<_ItemsContent> {
   static const List<String> _sizes = [
-    "XXS",
-    "XS",
-    "S",
-    "M",
-    "L",
-    "XL",
-    "2XL",
-    "3XL",
+    "XXS", "XS", "S", "M",
+    "L", "XL", "2XL", "3XL",
   ];
 
   final ImagePicker _picker = ImagePicker();
@@ -391,6 +389,7 @@ class _ItemsContentState extends State<_ItemsContent> {
   bool _foldersErrorShown = false;
   bool _itemsErrorShown = false;
 
+  //role helpers
   bool get _isAdmin => widget.role == "admin";
   bool get _isStorageManager => widget.role == "storage_manager";
 
@@ -447,6 +446,7 @@ class _ItemsContentState extends State<_ItemsContent> {
         msg.contains("failed host lookup");
   }
 
+  //firestore collection helpers
   CollectionReference<Map<String, dynamic>> _productsCol() {
     return FirebaseFirestore.instance
         .collection("tenants")
@@ -482,6 +482,7 @@ class _ItemsContentState extends State<_ItemsContent> {
         .collection("movement_history");
   }
 
+  //utility helpers
   String _cleanErr(Object e) =>
       e.toString().replaceFirst("Exception: ", "").trim();
 
@@ -508,6 +509,7 @@ class _ItemsContentState extends State<_ItemsContent> {
     return aName.compareTo(bName);
   }
 
+  //cache then server helpers
   Future<DocumentSnapshot<Map<String, dynamic>>?> _tryGetDocCacheThenServer(
       DocumentReference<Map<String, dynamic>> ref,
       ) async {
@@ -617,6 +619,7 @@ class _ItemsContentState extends State<_ItemsContent> {
 
   int get _currentYear => DateTime.now().year;
 
+  //give faster UX
   Future<void> _completeWriteQuickly(Future<void> future) async {
     try {
       await future.timeout(const Duration(milliseconds: 900));
@@ -653,6 +656,7 @@ class _ItemsContentState extends State<_ItemsContent> {
     }
   }
 
+  //order creation logic - decide how to create a new order
   Future<_OrderCreatePayload?> _promptOrderInfoWithShopLogic() async {
     if (_isSignedOut() || _handledSignedOut) return null;
 
@@ -772,6 +776,7 @@ class _ItemsContentState extends State<_ItemsContent> {
     );
   }
 
+  //image cropping
   Future<XFile> _autoCenterCropTo4by3(
       XFile input, {
         int jpegQuality = 85,
@@ -815,12 +820,14 @@ class _ItemsContentState extends State<_ItemsContent> {
     final List<int> outJpg = img.encodeJpg(cropped, quality: jpegQuality);
 
     if (kIsWeb) {
+      //create image from bytes in memory (web)
       return XFile.fromData(
         Uint8List.fromList(outJpg),
         name: "cropped_4x3.jpg",
         mimeType: "image/jpeg",
       );
     } else {
+      //create image from bytes in memory (mobile)
       final dir = await getTemporaryDirectory();
       final path =
           "${dir.path}/cropped_4x3_${DateTime.now().millisecondsSinceEpoch}.jpg";
@@ -1138,6 +1145,7 @@ class _ItemsContentState extends State<_ItemsContent> {
     }
   }
 
+  //folder actions
   Future<void> _renameFolder(String folderId, String currentName) async {
     if (await _isProtectedFolderById(folderId)) {
       _showErrorToast("Out of stock folders cannot be renamed.");
@@ -1342,6 +1350,7 @@ class _ItemsContentState extends State<_ItemsContent> {
       ),
     );
   }
+
 
   Future<void> _deleteFolderRecursive(String folderId) async {
     final itemsSnap = await _tryGetQueryCacheThenServer(
@@ -1712,6 +1721,7 @@ class _ItemsContentState extends State<_ItemsContent> {
     return c == q || c.startsWith(q) || c.contains(q);
   }
 
+  //folders section UI
   Widget _buildFoldersSection() {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: _foldersCol()
@@ -1806,6 +1816,7 @@ class _ItemsContentState extends State<_ItemsContent> {
     );
   }
 
+  //items section UI
   Widget _buildItemsSection() {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: _productsCol()
@@ -1953,7 +1964,7 @@ class _ItemsContentState extends State<_ItemsContent> {
       _isAdmin ? FloatingActionButtonLocation.centerDocked : null,
       floatingActionButton: _isAdmin && !keyboardOpen
           ? FloatingActionButton(
-        heroTag: null,  // ✅ UNIQUE TAG for ItemsScreen
+        heroTag: null,
         backgroundColor: const Color(0xff0B1E40),
         onPressed: _showAddMenu,
         child: const Icon(
@@ -1965,7 +1976,7 @@ class _ItemsContentState extends State<_ItemsContent> {
           : null,
       bottomNavigationBar: keyboardOpen
           ? null
-          : RepaintBoundary(  // ✅ ADD THIS
+          : RepaintBoundary(
         child: BottomNav(
           currentIndex: 1,
           hasFab: _isAdmin,

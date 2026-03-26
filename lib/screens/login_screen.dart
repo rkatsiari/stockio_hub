@@ -262,7 +262,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   const Text(
-                    "INVENTORY MANAGEMENT",
+                    "STOCKIO HUB",
                     textAlign: TextAlign.center,
                     style: TextStyle(
                       fontSize: 19,

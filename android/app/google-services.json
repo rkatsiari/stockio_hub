@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "262442832360",
+    "firebase_url": "https://inventory-management-app-5e9db-default-rtdb.europe-west1.firebasedatabase.app",
+    "project_id": "inventory-management-app-5e9db",
+    "storage_bucket": "inventory-management-app-5e9db.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:262442832360:android:5b68a14c8c711bee5cd45d",
+        "android_client_info": {
+          "package_name": "com.rkatsiari.inventory.inventory_management_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAH-MMeAAjjOKNJ3Z0_qhFnOITOZXOjb5Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

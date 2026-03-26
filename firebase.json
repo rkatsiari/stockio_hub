@@ -1,0 +1,55 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "inventory-management-app-5e9db",
+          "appId": "1:262442832360:android:5b68a14c8c711bee5cd45d",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "ios": {
+        "default": {
+          "projectId": "inventory-management-app-5e9db",
+          "appId": "1:262442832360:ios:551272316b10aa835cd45d",
+          "uploadDebugSymbols": false,
+          "fileOutput": "ios/Runner/GoogleService-Info.plist"
+        }
+      },
+      "macos": {
+        "default": {
+          "projectId": "inventory-management-app-5e9db",
+          "appId": "1:262442832360:ios:551272316b10aa835cd45d",
+          "uploadDebugSymbols": false,
+          "fileOutput": "macos/Runner/GoogleService-Info.plist"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "inventory-management-app-5e9db",
+          "configurations": {
+            "android": "1:262442832360:android:5b68a14c8c711bee5cd45d",
+            "ios": "1:262442832360:ios:551272316b10aa835cd45d",
+            "macos": "1:262442832360:ios:551272316b10aa835cd45d",
+            "web": "1:262442832360:web:90be5a627b7827c95cd45d",
+            "windows": "1:262442832360:web:5f6db6b3d05dbdff5cd45d"
+          }
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ]
+    }
+  ]
+}
