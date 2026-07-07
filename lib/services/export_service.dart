@@ -285,13 +285,14 @@ class ExportService {
 
     if (_imageCache.containsKey(clean)) return _imageCache[clean];
 
-    try {
-      final uri = Uri.tryParse(clean);
-      if (uri == null) {
-        _imageCache[clean] = null;
-        return null;
-      }
+    final uri = Uri.tryParse(clean);
+    if (uri == null) {
+      //malformed URL - this will never succeed, so it's safe to remember
+      _imageCache[clean] = null;
+      return null;
+    }
 
+    try {
       final resp = await http.get(uri).timeout(const Duration(seconds: 10));
       if (resp.statusCode == 200 && resp.bodyBytes.isNotEmpty) {
         _imageCache[clean] = resp.bodyBytes;
@@ -299,7 +300,10 @@ class ExportService {
       }
     } catch (_) {}
 
-    _imageCache[clean] = null;
+    //don't cache a network/timeout failure - it may be transient, and since
+    //this cache now lives on the singleton for the whole app session (not
+    //just one screen visit), permanently blacklisting an image here would
+    //mean it never loads again until the app is restarted
     return null;
   }
 
@@ -326,6 +330,14 @@ class ExportService {
     await file.writeAsBytes(bytes, flush: true);
 
     await Share.shareXFiles([XFile(file.path)], text: shareText);
+  }
+
+  //normalizes the selected export shop name into a display string and a
+  //filesystem-safe filename fragment (shared by both export methods)
+  (String, String) _safeShopNameAndFile(String shopName) {
+    final safeShop = shopName.trim().isEmpty ? "All" : shopName.trim();
+    final safeShopFile = safeShop.replaceAll(RegExp(r'[\\/:*?"<>|]'), "_");
+    return (safeShop, safeShopFile);
   }
 
   void _applyHeaderStyle(
@@ -450,9 +462,11 @@ class ExportService {
     }
     if (tenantId.trim().isEmpty) return;
 
-    final canExport = await _ensureInternetForExport();
-    if (!canExport) return;
-
+    //claim the export slot immediately - the internet check below awaits,
+    //and doing this first closes the window where a second rapid call
+    //(a fast double-tap, or tapping Profit then Stock in quick succession)
+    //could start a duplicate concurrent export before isExporting flips
+    //true. On failure we drop back to idle below.
     _setState(const ExportJobState(
       isExporting: true,
       isProfit: true,
@@ -460,6 +474,12 @@ class ExportService {
       progress: 0.0,
       progressText: "Preparing profit export...",
     ));
+
+    final canExport = await _ensureInternetForExport();
+    if (!canExport) {
+      _setState(ExportJobState.idle);
+      return;
+    }
 
     try {
       final fs = _firestore;
@@ -702,8 +722,7 @@ class ExportService {
       final bytes = workbook.saveAsStream();
       workbook.dispose();
 
-      final safeShop = shopName.trim().isEmpty ? "All" : shopName.trim();
-      final safeShopFile = safeShop.replaceAll(RegExp(r'[\\/:*?"<>|]'), "_");
+      final (safeShop, safeShopFile) = _safeShopNameAndFile(shopName);
       final safeTypeFile = (profitExportTypeLabels[profitType] ?? "Total")
           .replaceAll(" ", "_")
           .toLowerCase();
@@ -759,9 +778,8 @@ class ExportService {
     }
     if (tenantId.trim().isEmpty) return;
 
-    final canExport = await _ensureInternetForExport();
-    if (!canExport) return;
-
+    //claim the export slot immediately - see the same comment in
+    //exportProfitXlsx
     _setState(const ExportJobState(
       isExporting: true,
       isProfit: false,
@@ -769,6 +787,12 @@ class ExportService {
       progress: 0.0,
       progressText: "Preparing stock export...",
     ));
+
+    final canExport = await _ensureInternetForExport();
+    if (!canExport) {
+      _setState(ExportJobState.idle);
+      return;
+    }
 
     try {
       final fs = _firestore;
@@ -1321,8 +1345,7 @@ class ExportService {
       final bytes = workbook.saveAsStream();
       workbook.dispose();
 
-      final safeShop = shopName.trim().isEmpty ? "All" : shopName.trim();
-      final safeShopFile = safeShop.replaceAll(RegExp(r'[\\/:*?"<>|]'), "_");
+      final (safeShop, safeShopFile) = _safeShopNameAndFile(shopName);
       final filename = "stock_${safeShopFile}_$year.xlsx";
       final shareText = "Stock export ($safeShop • $year)";
 

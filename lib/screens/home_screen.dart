@@ -64,6 +64,9 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware {
   String? _insightsFutureKey;
   Future<Map<String, dynamic>>? _insightsFuture;
   Map<String, dynamic>? _lastInsightsData;
+  //the tenant/month/year key that _lastInsightsData actually belongs to, so
+  //it's only reused as a FutureBuilder initial value for a matching request
+  String? _lastInsightsDataKey;
 
   //tracks when the current insights future was kicked off, so a cached
   //result for the same tenant/month can expire and refresh instead of
@@ -82,6 +85,11 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware {
   //cashes
   final Map<String, String> _userNameCache = {};
 
+  //guards didChangeDependencies so the route-observer subscription and the
+  //initial "Home is visible" signal are only sent once - see the comment
+  //in didChangeDependencies for why this matters
+  bool _subscribedToRouteObserver = false;
+
   @override
   void initState() {
     super.initState();
@@ -91,6 +99,15 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+
+    // didChangeDependencies can fire more than once for this screen (e.g.
+    // system text-scale or theme changes) even while Home is mounted but
+    // covered by a pushed screen. Only treat the very first call as "Home
+    // just became visible" - every visibility change after that is handled
+    // by didPushNext/didPopNext below, which actually know whether Home is
+    // on top.
+    if (_subscribedToRouteObserver) return;
+    _subscribedToRouteObserver = true;
 
     final route = ModalRoute.of(context);
     if (route is PageRoute) {
@@ -802,7 +819,8 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware {
         _userNameCache[uid] = resolved;
         out[uid] = resolved;
       } catch (_) {
-        _userNameCache[uid] = uid;
+        //don't cache the failure - a transient error shouldn't permanently
+        //stick this user with their raw uid instead of their real name
         out[uid] = uid;
       }
     }
@@ -959,11 +977,13 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware {
       final cached = _insightsMemoryCache[key];
       if (cached != null) {
         _lastInsightsData = cached;
+        _lastInsightsDataKey = key;
       }
 
       _insightsFuture = _computeInsights(tenantId).then((data) {
         _insightsMemoryCache[key] = data;
         _lastInsightsData = data;
+        _lastInsightsDataKey = key;
         return data;
       });
     }
@@ -1053,7 +1073,14 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware {
     }
 
     final future = _getInsightsFuture(tenantId);
-    final initialInsightsData = _lastInsightsData;
+
+    // Only reuse cached data as the FutureBuilder's initial value when it
+    // actually belongs to the currently selected tenant/month/year -
+    // otherwise switching months would briefly show the previous month's
+    // figures with no loading indicator.
+    final currentKey = "$tenantId|$_dashYear|$_dashMonth";
+    final initialInsightsData =
+    _lastInsightsDataKey == currentKey ? _lastInsightsData : null;
 
     return FutureBuilder<Map<String, dynamic>>(
       future: future,
