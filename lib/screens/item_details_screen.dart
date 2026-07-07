@@ -3,6 +3,7 @@ import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 
 import '../services/offline_media_service.dart';
@@ -28,11 +29,65 @@ class ItemDetailsScreen extends StatefulWidget {
 }
 
 class ItemDetailsScreenState extends State<ItemDetailsScreen> {
-  //size list
+  // Adult t-shirt sizes. Kept as _sizes so the existing add/edit stock
+  // logic for older t-shirt items keeps working.
   static const List<String> _sizes = [
     "XXS", "XS", "S", "M",
     "L", "XL", "2XL", "3XL",
   ];
+
+  static const List<String> _kidsSizes = [
+    "1-2", "3-4", "5-6",
+    "7-8", "9-10", "11-12",
+  ];
+
+  List<String> _displaySizesForProduct({
+    required String itemType,
+    required String sizeGroup,
+    required Map<String, dynamic> sizeStockRaw,
+  }) {
+    if (itemType == "shoes") {
+      final keys = sizeStockRaw.keys
+          .map((k) => k.toString().trim())
+          .where((k) => k.isNotEmpty)
+          .toList();
+
+      keys.sort((a, b) {
+        final na = num.tryParse(a.replaceAll(',', '.'));
+        final nb = num.tryParse(b.replaceAll(',', '.'));
+        if (na != null && nb != null) return na.compareTo(nb);
+        return a.toLowerCase().compareTo(b.toLowerCase());
+      });
+
+      return keys;
+    }
+
+    if (itemType == "tshirt" && sizeGroup == "kids") {
+      return _kidsSizes;
+    }
+
+    return _sizes;
+  }
+
+  String _normalisedItemTypeFromData(Map<String, dynamic> data) {
+    final bool legacyIsTshirt = (data["isTshirt"] ?? false) == true;
+    final raw = (data["itemType"] ?? "").toString().trim().toLowerCase();
+
+    if (raw == "shoes" || raw == "shoe") return "shoes";
+    if (raw == "tshirt" || raw == "t-shirt" || raw == "shirt") return "tshirt";
+    if (raw == "item") return "item";
+
+    return legacyIsTshirt ? "tshirt" : "item";
+  }
+
+  String _normalisedSizeGroupFromData(Map<String, dynamic> data) {
+    final raw = (data["sizeGroup"] ?? "adult").toString().trim().toLowerCase();
+    return raw == "kids" ? "kids" : "adult";
+  }
+
+  bool _usesSizeStock(String itemType) {
+    return itemType == "tshirt" || itemType == "shoes";
+  }
 
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -233,6 +288,22 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
         .collection("tenants")
         .doc(tenantId)
         .collection("movement_history");
+  }
+
+  Future<void> _deleteProductImageFromStorage({
+    required String tenantId,
+    required String productId,
+  }) async {
+    try {
+      await FirebaseStorage.instance
+          .ref("tenants/$tenantId/products/$productId/main.jpg")
+          .delete();
+    } on FirebaseException catch (e) {
+      // If the image was already missing, continue deleting the item normally.
+      if (e.code != "object-not-found") {
+        rethrow;
+      }
+    }
   }
 
   //folder path builder
@@ -490,15 +561,23 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
             final data = doc?.data() ?? <String, dynamic>{};
             final String code = (data["code"] ?? "").toString().trim();
             final String imageUrl = (data["imageUrl"] ?? "").toString().trim();
-            final bool isTshirt = (data["isTshirt"] ?? false) == true;
+            final String itemType = _normalisedItemTypeFromData(data);
+            final String sizeGroup = _normalisedSizeGroupFromData(data);
             final int stock = _numToInt(data["stockQuantity"]);
 
             final Map<String, dynamic> sizeStockRaw =
                 (data["sizeStock"] as Map?)?.cast<String, dynamic>() ??
                     <String, dynamic>{};
 
+            final bool showSizeStock = _usesSizeStock(itemType);
+            final List<String> displaySizes = _displaySizesForProduct(
+              itemType: itemType,
+              sizeGroup: sizeGroup,
+              sizeStockRaw: sizeStockRaw,
+            );
+
             final Map<String, int> sizeStock = {
-              for (final s in _sizes) s: _numToInt(sizeStockRaw[s]),
+              for (final s in displaySizes) s: _numToInt(sizeStockRaw[s]),
             };
 
             if (imageUrl.isNotEmpty) {
@@ -516,9 +595,12 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
               role: bootstrap.role,
               code: code,
               imageUrl: imageUrl,
-              isTshirt: isTshirt,
+              itemType: itemType,
+              sizeGroup: sizeGroup,
+              showSizeStock: showSizeStock,
               stock: stock,
               sizeStock: sizeStock,
+              displaySizes: displaySizes,
               retailStream: retailRef.snapshots(includeMetadataChanges: true),
               wholesaleStream:
               wholesaleRef.snapshots(includeMetadataChanges: true),
@@ -562,15 +644,141 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
     );
   }
 
+  Future<void> _openFullImagePreview({
+    required String tenantId,
+    required String imageUrl,
+  }) async {
+    if (!mounted || imageUrl.trim().isEmpty) return;
+
+    final TransformationController controller = TransformationController();
+    double? swipeStartY;
+    int activePointers = 0;
+    bool closing = false;
+
+    await showDialog<void>(
+      context: context,
+      barrierColor: Colors.black,
+      builder: (dialogContext) {
+        final size = MediaQuery.of(dialogContext).size;
+
+        void closePreview() {
+          if (closing || !dialogContext.mounted) return;
+          closing = true;
+          Navigator.of(dialogContext).pop();
+        }
+
+        return Dialog.fullscreen(
+          backgroundColor: Colors.black,
+          child: Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: (event) {
+              activePointers++;
+              if (activePointers == 1) {
+                swipeStartY = event.position.dy;
+              }
+            },
+            onPointerMove: (event) {
+              final double currentScale = controller.value.getMaxScaleOnAxis();
+
+              // Only close with swipe down when the image is not zoomed.
+              // When zoomed in, dragging is kept for moving around the image.
+              if (activePointers != 1 || currentScale > 1.01 || swipeStartY == null) {
+                return;
+              }
+
+              final double swipeDistance = event.position.dy - swipeStartY!;
+              if (swipeDistance > 140) {
+                closePreview();
+              }
+            },
+            onPointerUp: (_) {
+              activePointers = (activePointers - 1).clamp(0, 10);
+              if (activePointers == 0) {
+                swipeStartY = null;
+              }
+            },
+            onPointerCancel: (_) {
+              activePointers = (activePointers - 1).clamp(0, 10);
+              if (activePointers == 0) {
+                swipeStartY = null;
+              }
+            },
+            child: Stack(
+              children: [
+                SizedBox(
+                  width: size.width,
+                  height: size.height,
+                  child: InteractiveViewer(
+                    transformationController: controller,
+                    panEnabled: true,
+                    scaleEnabled: true,
+                    minScale: 1,
+                    maxScale: 5,
+                    boundaryMargin: EdgeInsets.zero,
+                    constrained: true,
+                    onInteractionEnd: (_) {
+                      final double currentScale =
+                      controller.value.getMaxScaleOnAxis();
+
+                      if (currentScale <= 1.01) {
+                        controller.value = Matrix4.identity();
+                      }
+                    },
+                    child: SizedBox(
+                      width: size.width,
+                      height: size.height,
+                      child: Center(
+                        child: OfflineImageWidget(
+                          tenantId: tenantId,
+                          productId: widget.itemId,
+                          imageUrl: imageUrl,
+                          fit: BoxFit.contain,
+                          errorWidget: const Icon(
+                            Icons.image,
+                            size: 120,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  top: 40,
+                  right: 16,
+                  child: IconButton(
+                    icon: const Icon(
+                      Icons.close,
+                      color: Colors.white,
+                      size: 30,
+                    ),
+                    onPressed: closePreview,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    // Do not dispose this controller here because InteractiveViewer may still
+    // finish its internal animation for a few frames after the dialog closes.
+    // Disposing immediately can cause: "TransformationController was used after being disposed."
+  }
+
   //builds the actual item details UI
   Widget _buildBody({
     required String? tenantId,
     required String role,
     required String code,
     required String imageUrl,
-    required bool isTshirt,
+    required String itemType,
+    required String sizeGroup,
+    required bool showSizeStock,
     required int stock,
     required Map<String, int> sizeStock,
+    required List<String> displaySizes,
     required Stream<DocumentSnapshot<Map<String, dynamic>>>? retailStream,
     required Stream<DocumentSnapshot<Map<String, dynamic>>>? wholesaleStream,
     required Stream<DocumentSnapshot<Map<String, dynamic>>>? costStream,
@@ -580,26 +788,36 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
       child: Column(
         children: [
           //image area
-          Container(
-            width: double.infinity,
-            height: 300,
-            color: Colors.grey.shade200,
-            child: (tenantId != null && imageUrl.isNotEmpty)
-                ? OfflineImageWidget(
-              tenantId: tenantId,
-              productId: widget.itemId,
-              imageUrl: imageUrl,
-              fit: BoxFit.contain,
-              errorWidget: const Icon(
+          AspectRatio(
+            aspectRatio: 4 / 3,
+            child: Container(
+              width: double.infinity,
+              color: Colors.grey.shade200,
+              child: (tenantId != null && imageUrl.isNotEmpty)
+                  ? GestureDetector(
+                onTap: () {
+                  _openFullImagePreview(
+                    tenantId: tenantId,
+                    imageUrl: imageUrl,
+                  );
+                },
+                child: OfflineImageWidget(
+                  tenantId: tenantId,
+                  productId: widget.itemId,
+                  imageUrl: imageUrl,
+                  fit: BoxFit.cover,
+                  errorWidget: const Icon(
+                    Icons.image,
+                    size: 120,
+                    color: Colors.grey,
+                  ),
+                ),
+              )
+                  : const Icon(
                 Icons.image,
                 size: 120,
                 color: Colors.grey,
               ),
-            )
-                : const Icon(
-              Icons.image,
-              size: 120,
-              color: Colors.grey,
             ),
           ),
           //product code
@@ -616,12 +834,15 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 25),
             child: Column(
-              children: [ //stock section if it is a t-shirt item
-                if (!isTshirt)
+              children: [
+                if (!showSizeStock)
                   _infoRow("Stock Quantity", stock.toString())
                 else ...[
                   const SizedBox(height: 10),
-                  _sizeStockTableReadOnly(sizeStock),
+                  _sizeStockTableReadOnly(
+                    sizeStock,
+                    sizes: displaySizes,
+                  ),
                   const SizedBox(height: 10),
                   _infoRow("Total Stock", stock.toString()),
                 ],
@@ -746,9 +967,24 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
     }
 
     final data = snap.data() ?? <String, dynamic>{};
-    final bool isTshirt = (data["isTshirt"] ?? false) == true;
+    final itemType = _normalisedItemTypeFromData(data);
+    final sizeGroup = _normalisedSizeGroupFromData(data);
 
-    return _AddStockDialogData(isTshirt: isTshirt);
+    final Map<String, dynamic> sizeStockRaw =
+        (data["sizeStock"] as Map?)?.cast<String, dynamic>() ??
+            <String, dynamic>{};
+
+    final displaySizes = _displaySizesForProduct(
+      itemType: itemType,
+      sizeGroup: sizeGroup,
+      sizeStockRaw: sizeStockRaw,
+    );
+
+    return _AddStockDialogData(
+      itemType: itemType,
+      sizeGroup: sizeGroup,
+      displaySizes: displaySizes,
+    );
   }
 
   //add stock logic
@@ -763,7 +999,7 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
     final noteCtrl = TextEditingController();
     final addCtrl = TextEditingController(text: "0");
     final Map<String, TextEditingController> sizeAddCtrls = {
-      for (final s in _sizes) s: TextEditingController(text: "0"),
+      for (final s in draft.displaySizes) s: TextEditingController(text: "0"),
     };
 
     try {
@@ -774,7 +1010,7 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
           content: SingleChildScrollView(
             child: Column(
               children: [
-                if (!draft.isTshirt)
+                if (!_usesSizeStock(draft.itemType))
                   TextField(
                     controller: addCtrl,
                     keyboardType: TextInputType.number,
@@ -783,7 +1019,10 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
                     ),
                   )
                 else
-                  _sizeAddTableEditor(sizeAddCtrls),
+                  _sizeAddTableEditor(
+                    sizeAddCtrls,
+                    sizes: draft.displaySizes,
+                  ),
                 const SizedBox(height: 10),
                 TextField(
                   controller: noteCtrl,
@@ -820,8 +1059,19 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
       }
 
       final p = productSnap.data() ?? <String, dynamic>{};
-      final bool tshirt = (p["isTshirt"] ?? false) == true;
+      final itemType = _normalisedItemTypeFromData(p);
+      final sizeGroup = _normalisedSizeGroupFromData(p);
       final currentStock = _numToInt(p["stockQuantity"]);
+
+      final Map<String, dynamic> raw =
+          (p["sizeStock"] as Map?)?.cast<String, dynamic>() ??
+              <String, dynamic>{};
+
+      final displaySizes = _displaySizesForProduct(
+        itemType: itemType,
+        sizeGroup: sizeGroup,
+        sizeStockRaw: raw,
+      );
 
       final yearsDoc = docRef.collection("stock_years").doc(yearStr);
       final movesCol = docRef.collection("stock_movements");
@@ -843,7 +1093,7 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
       int deltaTotal = 0;
       Map<String, int>? sizeDelta;
 
-      if (!tshirt) {
+      if (!_usesSizeStock(itemType)) {
         final addQty = int.tryParse(addCtrl.text.trim()) ?? 0;
         if (addQty <= 0) {
           _toastInfo("Enter a quantity greater than 0.");
@@ -854,6 +1104,8 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
         final newStock = currentStock + addQty;
 
         batch.update(docRef, {
+          "itemType": "item",
+          "isTshirt": false,
           "stockQuantity": newStock,
           "updatedAt": FieldValue.serverTimestamp(),
         });
@@ -867,17 +1119,18 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
           SetOptions(merge: true),
         );
       } else {
-        final Map<String, dynamic> raw =
-            (p["sizeStock"] as Map?)?.cast<String, dynamic>() ??
-                <String, dynamic>{};
+        if (displaySizes.isEmpty) {
+          _toastInfo("No sizes found for this item.");
+          return;
+        }
 
         final Map<String, int> currentSizeStock = {
-          for (final s in _sizes) s: _numToInt(raw[s]),
+          for (final s in displaySizes) s: _numToInt(raw[s]),
         };
 
         final Map<String, int> addMap = {
-          for (final s in _sizes)
-            s: int.tryParse(sizeAddCtrls[s]!.text.trim()) ?? 0,
+          for (final s in displaySizes)
+            s: int.tryParse(sizeAddCtrls[s]?.text.trim() ?? "0") ?? 0,
         };
 
         deltaTotal = addMap.values.fold<int>(0, (a, b) => a + b);
@@ -893,13 +1146,16 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
         if (nz.isNotEmpty) sizeDelta = nz;
 
         final Map<String, int> newSizeStock = {
-          for (final s in _sizes)
+          for (final s in displaySizes)
             s: (currentSizeStock[s] ?? 0) + (addMap[s] ?? 0),
         };
 
         final newTotal = newSizeStock.values.fold<int>(0, (a, b) => a + b);
 
         batch.update(docRef, {
+          "itemType": itemType,
+          if (itemType == "tshirt") "sizeGroup": sizeGroup,
+          "isTshirt": itemType == "tshirt",
           "sizeStock": newSizeStock,
           "stockQuantity": newTotal,
           "updatedAt": FieldValue.serverTimestamp(),
@@ -1093,7 +1349,8 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
     }
 
     final data = snapshot.data() ?? <String, dynamic>{};
-    final bool isTshirt = (data["isTshirt"] ?? false) == true;
+    final itemType = _normalisedItemTypeFromData(data);
+    final sizeGroup = _normalisedSizeGroupFromData(data);
 
     final int oldTotalStock = _numToInt(data["stockQuantity"]);
 
@@ -1101,8 +1358,14 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
         (data["sizeStock"] as Map?)?.cast<String, dynamic>() ??
             <String, dynamic>{};
 
+    final displaySizes = _displaySizesForProduct(
+      itemType: itemType,
+      sizeGroup: sizeGroup,
+      sizeStockRaw: oldSizeRaw,
+    );
+
     final Map<String, int> oldSizeStock = {
-      for (final s in _sizes) s: _numToInt(oldSizeRaw[s]),
+      for (final s in displaySizes) s: _numToInt(oldSizeRaw[s]),
     };
 
     final retailSnap = await _tryGetDocCacheThenServer(retailRef);
@@ -1127,7 +1390,9 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
     }
 
     return _EditDialogData(
-      isTshirt: isTshirt,
+      itemType: itemType,
+      sizeGroup: sizeGroup,
+      displaySizes: displaySizes,
       code: (data["code"] ?? "").toString(),
       oldTotalStock: oldTotalStock,
       oldSizeStock: oldSizeStock,
@@ -1157,7 +1422,7 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
     final costCtrl = TextEditingController(text: draft.cost.toStringAsFixed(2));
 
     final Map<String, TextEditingController> sizeCtrls = {
-      for (final s in _sizes)
+      for (final s in draft.displaySizes)
         s: TextEditingController(text: (draft.oldSizeStock[s] ?? 0).toString()),
     };
 
@@ -1174,7 +1439,7 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
                   decoration: const InputDecoration(labelText: "Code"),
                 ),
                 const SizedBox(height: 10),
-                if (!draft.isTshirt)
+                if (!_usesSizeStock(draft.itemType))
                   TextField(
                     controller: stockCtrl,
                     keyboardType: TextInputType.number,
@@ -1183,7 +1448,10 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
                     ),
                   )
                 else
-                  _sizeStockTableEditor(sizeCtrls),
+                  _sizeStockTableEditor(
+                    sizeCtrls,
+                    sizes: draft.displaySizes,
+                  ),
                 const SizedBox(height: 10),
                 TextField(
                   controller: retailCtrl,
@@ -1235,10 +1503,13 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
 
       final Map<String, dynamic> updateData = {
         "code": newCode,
+        "itemType": draft.itemType,
+        "isTshirt": draft.itemType == "tshirt",
+        if (draft.itemType == "tshirt") "sizeGroup": draft.sizeGroup,
         "updatedAt": FieldValue.serverTimestamp(),
       };
 
-      if (!draft.isTshirt) {
+      if (!_usesSizeStock(draft.itemType)) {
         newTotalStock = int.tryParse(stockCtrl.text.trim()) ?? 0;
         if (newTotalStock < 0) {
           _toastInfo("Stock cannot be negative.");
@@ -1246,9 +1517,14 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
         }
         updateData["stockQuantity"] = newTotalStock;
       } else {
+        if (draft.displaySizes.isEmpty) {
+          _toastInfo("No sizes found for this item.");
+          return;
+        }
+
         newSizeStockMap = {
-          for (final s in _sizes)
-            s: int.tryParse(sizeCtrls[s]!.text.trim()) ?? 0,
+          for (final s in draft.displaySizes)
+            s: int.tryParse(sizeCtrls[s]?.text.trim() ?? "0") ?? 0,
         };
 
         final hasNegative = newSizeStockMap.values.any((v) => v < 0);
@@ -1294,9 +1570,9 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
       final int delta = newTotalStock - draft.oldTotalStock;
 
       Map<String, int>? sizeDelta;
-      if (draft.isTshirt && newSizeStockMap != null) {
+      if (_usesSizeStock(draft.itemType) && newSizeStockMap != null) {
         final Map<String, int> d = {
-          for (final s in _sizes)
+          for (final s in draft.displaySizes)
             s: (newSizeStockMap[s] ?? 0) - (draft.oldSizeStock[s] ?? 0),
         };
         final nonZero = <String, int>{};
@@ -1307,7 +1583,36 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
       }
 
       if (delta != 0 || (sizeDelta != null && sizeDelta.isNotEmpty)) {
+        final now = DateTime.now();
+        final yearStr = now.year.toString();
+        final yearsDoc = docRef.collection("stock_years").doc(yearStr);
         final movesCol = docRef.collection("stock_movements");
+
+        final ySnap = await _tryGetDocCacheThenServer(yearsDoc);
+        if (ySnap == null || !ySnap.exists) {
+          batch.set(yearsDoc, {
+            "year": now.year,
+            "initialStock": draft.oldTotalStock,
+            "currentStock": draft.oldTotalStock,
+            if (_usesSizeStock(draft.itemType))
+              "currentSizeStock": draft.oldSizeStock,
+            "createdAt": FieldValue.serverTimestamp(),
+            "createdBy": uid,
+            "createdByName": userName,
+          });
+        }
+
+        batch.set(
+          yearsDoc,
+          {
+            "currentStock": newTotalStock,
+            if (_usesSizeStock(draft.itemType) && newSizeStockMap != null)
+              "currentSizeStock": newSizeStockMap,
+            "updatedAt": FieldValue.serverTimestamp(),
+          },
+          SetOptions(merge: true),
+        );
+
         batch.set(movesCol.doc(), {
           "type": "adjust",
           "delta": delta,
@@ -1316,6 +1621,8 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
           "at": FieldValue.serverTimestamp(),
           "by": uid,
           "byName": userName,
+          "year": now.year,
+          "tenantId": tenantId,
         });
       }
 
@@ -1379,6 +1686,11 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
       batch.delete(docRef);
       await batch.commit();
 
+      await _deleteProductImageFromStorage(
+        tenantId: tenantId,
+        productId: docRef.id,
+      );
+
       await OfflineMediaService.instance.deleteOfflineImage(
         tenantId: tenantId,
         productId: docRef.id,
@@ -1396,10 +1708,16 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
   }
 
   //size stock UI helpers
-  Widget _sizeStockTableReadOnly(Map<String, int> sizeStock) {
+  Widget _sizeStockTableReadOnly(
+      Map<String, int> sizeStock, {
+        required List<String> sizes,
+      }) {
     const double gap = 12;
-    final row1 = _sizes.sublist(0, 4);
-    final row2 = _sizes.sublist(4, 8);
+    final visibleSizes = sizes.where((s) => s.trim().isNotEmpty).toList();
+
+    if (visibleSizes.isEmpty) {
+      return const SizedBox.shrink();
+    }
 
     Widget cell(String s, double w) {
       return SizedBox(
@@ -1415,6 +1733,9 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
             children: [
               Text(
                 s,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: 12,
@@ -1433,109 +1754,74 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
 
     return LayoutBuilder(
       builder: (context, constraints) {
+        const int columnCount = 4;
         final maxW = constraints.maxWidth;
-        final cellW = ((maxW - (gap * 3)) / 4).clamp(60.0, 110.0);
+        final cellW = ((maxW - (gap * (columnCount - 1))) / columnCount)
+            .clamp(60.0, 110.0);
 
-        Row buildRow(List<String> row) {
-          return Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              for (final s in row) ...[
-                cell(s, cellW),
-                if (s != row.last) const SizedBox(width: gap),
-              ],
-            ],
-          );
+        final rows = <List<String>>[];
+        for (int i = 0; i < visibleSizes.length; i += columnCount) {
+          final end = (i + columnCount) > visibleSizes.length
+              ? visibleSizes.length
+              : i + columnCount;
+          rows.add(visibleSizes.sublist(i, end));
         }
 
         return Column(
           children: [
-            buildRow(row1),
-            const SizedBox(height: 14),
-            buildRow(row2),
+            for (int rowIndex = 0; rowIndex < rows.length; rowIndex++) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  for (final s in rows[rowIndex]) ...[
+                    cell(s, cellW.toDouble()),
+                    if (s != rows[rowIndex].last) const SizedBox(width: gap),
+                  ],
+                ],
+              ),
+              if (rowIndex != rows.length - 1) const SizedBox(height: 14),
+            ],
           ],
         );
       },
     );
   }
 
-  Widget _sizeStockTableEditor(Map<String, TextEditingController> ctrls) {
-    const double cellW = 64;
-    const double gap = 8;
 
-    Widget cell(String s) {
-      return SizedBox(
-        width: cellW,
-        child: Column(
-          children: [
-            Text(
-              s,
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 12,
-              ),
-            ),
-            const SizedBox(height: 6),
-            TextField(
-              controller: ctrls[s],
-              keyboardType: TextInputType.number,
-              textAlign: TextAlign.center,
-              decoration: const InputDecoration(
-                isDense: true,
-                contentPadding: EdgeInsets.symmetric(
-                  horizontal: 6,
-                  vertical: 8,
-                ),
-                border: OutlineInputBorder(),
-              ),
-              style: const TextStyle(fontSize: 13),
-            ),
-          ],
-        ),
-      );
-    }
-
-    final row1 = _sizes.sublist(0, 4);
-    final row2 = _sizes.sublist(4, 8);
-
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              "Size Quantities",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              for (final s in row1) ...[
-                cell(s),
-                if (s != row1.last) const SizedBox(width: gap),
-              ],
-            ],
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              for (final s in row2) ...[
-                cell(s),
-                if (s != row2.last) const SizedBox(width: gap),
-              ],
-            ],
-          ),
-        ],
-      ),
+  Widget _sizeStockTableEditor(
+      Map<String, TextEditingController> ctrls, {
+        required List<String> sizes,
+      }) {
+    return _sizeQuantityEditor(
+      ctrls,
+      sizes: sizes,
+      title: "Size Quantities",
     );
   }
 
-  Widget _sizeAddTableEditor(Map<String, TextEditingController> ctrls) {
+  Widget _sizeAddTableEditor(
+      Map<String, TextEditingController> ctrls, {
+        required List<String> sizes,
+      }) {
+    return _sizeQuantityEditor(
+      ctrls,
+      sizes: sizes,
+      title: "Add per size",
+    );
+  }
+
+  Widget _sizeQuantityEditor(
+      Map<String, TextEditingController> ctrls, {
+        required List<String> sizes,
+        required String title,
+      }) {
     const double cellW = 64;
     const double gap = 8;
+    final visibleSizes = sizes.where((s) => s.trim().isNotEmpty).toList();
+
+    if (visibleSizes.isEmpty) {
+      return const SizedBox.shrink();
+    }
 
     Widget cell(String s) {
       return SizedBox(
@@ -1544,6 +1830,9 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
           children: [
             Text(
               s,
+              textAlign: TextAlign.center,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: const TextStyle(
                 fontWeight: FontWeight.bold,
                 fontSize: 12,
@@ -1569,39 +1858,36 @@ class ItemDetailsScreenState extends State<ItemDetailsScreen> {
       );
     }
 
-    final row1 = _sizes.sublist(0, 4);
-    final row2 = _sizes.sublist(4, 8);
+    final rows = <List<String>>[];
+    for (int i = 0; i < visibleSizes.length; i += 4) {
+      final end = (i + 4) > visibleSizes.length ? visibleSizes.length : i + 4;
+      rows.add(visibleSizes.sublist(i, end));
+    }
 
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Align(
+          Align(
             alignment: Alignment.centerLeft,
             child: Text(
-              "Add per size",
-              style: TextStyle(fontWeight: FontWeight.bold),
+              title,
+              style: const TextStyle(fontWeight: FontWeight.bold),
             ),
           ),
           const SizedBox(height: 10),
-          Row(
-            children: [
-              for (final s in row1) ...[
-                cell(s),
-                if (s != row1.last) const SizedBox(width: gap),
+          for (int rowIndex = 0; rowIndex < rows.length; rowIndex++) ...[
+            Row(
+              children: [
+                for (final s in rows[rowIndex]) ...[
+                  cell(s),
+                  if (s != rows[rowIndex].last) const SizedBox(width: gap),
+                ],
               ],
-            ],
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              for (final s in row2) ...[
-                cell(s),
-                if (s != row2.last) const SizedBox(width: gap),
-              ],
-            ],
-          ),
+            ),
+            if (rowIndex != rows.length - 1) const SizedBox(height: 10),
+          ],
         ],
       ),
     );
@@ -1695,10 +1981,14 @@ class _ActionContext {
 }
 
 class _AddStockDialogData {
-  final bool isTshirt;
+  final String itemType;
+  final String sizeGroup;
+  final List<String> displaySizes;
 
   const _AddStockDialogData({
-    required this.isTshirt,
+    required this.itemType,
+    required this.sizeGroup,
+    required this.displaySizes,
   });
 }
 
@@ -1713,7 +2003,9 @@ class _MoveDialogData {
 }
 
 class _EditDialogData {
-  final bool isTshirt;
+  final String itemType;
+  final String sizeGroup;
+  final List<String> displaySizes;
   final String code;
   final int oldTotalStock;
   final Map<String, int> oldSizeStock;
@@ -1722,7 +2014,9 @@ class _EditDialogData {
   final double cost;
 
   const _EditDialogData({
-    required this.isTshirt,
+    required this.itemType,
+    required this.sizeGroup,
+    required this.displaySizes,
     required this.code,
     required this.oldTotalStock,
     required this.oldSizeStock,

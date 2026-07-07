@@ -1,6 +1,7 @@
 //edit details of an existing user
 import 'dart:async';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -41,6 +42,11 @@ class _EditUserScreenState extends State<EditUserScreen> {
 
   StreamSubscription<User?>? _authSub;
   bool _handledSignedOut = false;
+  bool _existingShopAccessLoaded = false;
+  bool _visibleShopIdsFieldExists = false;
+  bool _shopIdsInitialised = false;
+  Set<String>? _existingVisibleShopIds;
+  final Set<String> _selectedShopIds = <String>{};
 
   //role labels map - connect role values to user-friendly labels
   static const Map<String, String> _roleLabels = {
@@ -65,6 +71,7 @@ class _EditUserScreenState extends State<EditUserScreen> {
     );
 
     _listenToAuthChanges();
+    unawaited(_loadExistingShopAccess());
   }
 
   void _listenToAuthChanges() {
@@ -136,6 +143,249 @@ class _EditUserScreenState extends State<EditUserScreen> {
   void _showErrorToast(String message) {
     if (!_canUseContext()) return;
     TopToast.error(context, message);
+  }
+
+  bool _roleUsesShopPermissions(String value) {
+    final cleanRole = value.trim().toLowerCase();
+    return cleanRole != "admin" && cleanRole != "storage_manager";
+  }
+
+
+
+  CollectionReference<Map<String, dynamic>> _shopsRef() {
+    return FirebaseFirestore.instance
+        .collection("tenants")
+        .doc(widget.tenantId)
+        .collection("shops");
+  }
+
+  DocumentReference<Map<String, dynamic>> _tenantUserRef() {
+    return FirebaseFirestore.instance
+        .collection("tenants")
+        .doc(widget.tenantId)
+        .collection("users")
+        .doc(widget.uid);
+  }
+
+  DocumentReference<Map<String, dynamic>> _rootUserRef() {
+    return FirebaseFirestore.instance.collection("users").doc(widget.uid);
+  }
+
+  Set<String>? _parseVisibleShopIds(Map<String, dynamic> data) {
+    if (!data.containsKey("visibleShopIds")) return null;
+    final raw = data["visibleShopIds"];
+    if (raw == null) return <String>{};
+    if (raw is Iterable) {
+      return raw
+          .map((e) => e.toString().trim())
+          .where((id) => id.isNotEmpty)
+          .toSet();
+    }
+    return <String>{};
+  }
+
+  Future<void> _loadExistingShopAccess() async {
+    Set<String>? visibleIds;
+    bool fieldExists = false;
+
+    final refs = <DocumentReference<Map<String, dynamic>>>[
+      _tenantUserRef(),
+      _rootUserRef(),
+    ];
+
+    for (final ref in refs) {
+      try {
+        final snap = await ref.get(const GetOptions(source: Source.cache));
+        final data = snap.data();
+        if (snap.exists && data != null && data.containsKey("visibleShopIds")) {
+          visibleIds = _parseVisibleShopIds(data);
+          fieldExists = true;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    if (!fieldExists) {
+      for (final ref in refs) {
+        try {
+          final snap = await ref.get();
+          final data = snap.data();
+          if (snap.exists && data != null && data.containsKey("visibleShopIds")) {
+            visibleIds = _parseVisibleShopIds(data);
+            fieldExists = true;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (!mounted || _handledSignedOut) return;
+    setState(() {
+      _existingVisibleShopIds = visibleIds;
+      _visibleShopIdsFieldExists = fieldExists;
+      _existingShopAccessLoaded = true;
+    });
+  }
+
+  Future<void> _saveVisibleShopIdsForUser() async {
+    final ids = _selectedShopIds.toList()..sort();
+    final batch = FirebaseFirestore.instance.batch();
+    final data = <String, dynamic>{
+      "visibleShopIds": ids,
+      "shopAccessUpdatedAt": FieldValue.serverTimestamp(),
+    };
+
+    batch.set(_tenantUserRef(), data, SetOptions(merge: true));
+    batch.set(_rootUserRef(), data, SetOptions(merge: true));
+    await batch.commit();
+  }
+
+  Widget _buildShopAccessSelector(bool isLoading) {
+    if (!_existingShopAccessLoaded) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 12),
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: _shopsRef().orderBy("createdAt", descending: false).snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return const Text("Could not load shops.");
+        }
+
+        if (!snapshot.hasData) {
+          return const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Center(child: CircularProgressIndicator()),
+          );
+        }
+
+        final shops = snapshot.data!.docs;
+        final allShopIds = shops.map((d) => d.id).toSet();
+
+        if (!_shopIdsInitialised) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted || _shopIdsInitialised) return;
+            setState(() {
+              _selectedShopIds
+                ..clear()
+                ..addAll(_visibleShopIdsFieldExists
+                    ? (_existingVisibleShopIds ?? <String>{}).where(allShopIds.contains)
+                    : allShopIds);
+              _shopIdsInitialised = true;
+            });
+          });
+        }
+
+        if (shops.isEmpty) {
+          return const Padding(
+            padding: EdgeInsets.only(top: 4),
+            child: Text(
+              "No shops have been created yet. This user will not be able to create shop orders until shops are added.",
+              style: TextStyle(color: Colors.black54),
+            ),
+          );
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    "Shop permissions",
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.black87,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 36),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    foregroundColor: const Color(0xff0B1E40),
+                  ),
+                  onPressed: isLoading
+                      ? null
+                      : () {
+                    setState(() {
+                      _selectedShopIds
+                        ..clear()
+                        ..addAll(allShopIds);
+                      _shopIdsInitialised = true;
+                    });
+                  },
+                  child: const Text("All"),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 36),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    foregroundColor: const Color(0xff0B1E40),
+                  ),
+                  onPressed: isLoading
+                      ? null
+                      : () {
+                    setState(() {
+                      _selectedShopIds.clear();
+                      _shopIdsInitialised = true;
+                    });
+                  },
+                  child: const Text("None"),
+                ),
+              ],
+            ),
+            Text(
+              _selectedShopIds.isEmpty
+                  ? "No shops selected. This user cannot create orders."
+                  : "Selected ${_selectedShopIds.length} of ${shops.length} shops.",
+              style: TextStyle(
+                color: _selectedShopIds.isEmpty
+                    ? Colors.red.shade700
+                    : Colors.black54,
+                fontSize: 12,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ...shops.map((shop) {
+              final data = shop.data();
+              final name = (data["name"] ?? "Untitled").toString();
+              final selected = _selectedShopIds.contains(shop.id);
+
+              return CheckboxListTile(
+                value: selected,
+                enabled: !isLoading,
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                visualDensity: const VisualDensity(horizontal: -4, vertical: -3),
+                title: Text(name),
+                secondary: const Icon(Icons.store_outlined),
+                controlAffinity: ListTileControlAffinity.trailing,
+                onChanged: isLoading
+                    ? null
+                    : (value) {
+                  setState(() {
+                    _shopIdsInitialised = true;
+                    if (value == true) {
+                      _selectedShopIds.add(shop.id);
+                    } else {
+                      _selectedShopIds.remove(shop.id);
+                    }
+                  });
+                },
+              );
+            }),
+          ],
+        );
+      },
+    );
   }
 
   //firebase function errors
@@ -240,6 +490,10 @@ class _EditUserScreenState extends State<EditUserScreen> {
         "role": selectedRole,
       });
 
+      if (_roleUsesShopPermissions(selectedRole)) {
+        await _saveVisibleShopIdsForUser();
+      }
+
       if (!_canUseContext()) return;
 
       await Future<void>.delayed(const Duration(milliseconds: 180));
@@ -334,6 +588,22 @@ class _EditUserScreenState extends State<EditUserScreen> {
                           : (value) {
                         _selectedRole.value = value ?? "staff";
                       },
+                    );
+                  },
+                ),
+                ValueListenableBuilder<String>(
+                  valueListenable: _selectedRole,
+                  builder: (context, selectedRole, _) {
+                    if (!_roleUsesShopPermissions(selectedRole)) {
+                      return const SizedBox.shrink();
+                    }
+
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const SizedBox(height: 20),
+                        _buildShopAccessSelector(isLoading),
+                      ],
                     );
                   },
                 ),

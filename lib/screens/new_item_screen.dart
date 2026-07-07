@@ -1,4 +1,3 @@
-//add new
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
@@ -33,11 +32,53 @@ class NewItemScreen extends StatefulWidget {
   State<NewItemScreen> createState() => _NewItemScreenState();
 }
 
+enum _NewItemType {
+  item,
+  tshirt,
+  shoes,
+}
+
+enum _TshirtSizeGroup {
+  adult,
+  kids,
+}
+
+class _ShoeSizeRow {
+  final TextEditingController sizeCtrl;
+  final TextEditingController qtyCtrl;
+
+  _ShoeSizeRow()
+      : sizeCtrl = TextEditingController(),
+        qtyCtrl = TextEditingController(text: '0');
+
+  void dispose() {
+    sizeCtrl.dispose();
+    qtyCtrl.dispose();
+  }
+}
+
 class _NewItemScreenState extends State<NewItemScreen> {
-  static const List<String> _sizes = [
-    "XXS", "XS", "S", "M",
-    "L", "XL", "2XL", "3XL",
+  static const List<String> _adultSizes = [
+    'XXS',
+    'XS',
+    'S',
+    'M',
+    'L',
+    'XL',
+    '2XL',
+    '3XL',
   ];
+
+  static const List<String> _kidsSizes = [
+    '1-2',
+    '3-4',
+    '5-6',
+    '7-8',
+    '9-10',
+    '11-12',
+  ];
+
+  static const Color _appColor = Color(0xff0B1E40);
 
   final TextEditingController codeCtrl = TextEditingController();
   final TextEditingController costCtrl = TextEditingController();
@@ -46,16 +87,18 @@ class _NewItemScreenState extends State<NewItemScreen> {
   final TextEditingController qtyCtrl = TextEditingController();
 
   late final Map<String, TextEditingController> _sizeCtrls;
+  final List<_ShoeSizeRow> _shoeRows = <_ShoeSizeRow>[];
 
   StreamSubscription<User?>? _authSub;
   Future<_NewItemBootstrapState>? _bootstrapFuture;
 
-  bool _isTshirt = false; //switches UI logic
-  bool _saving = false; //disable UI while saving
-  bool _closedAfterSave = false; //prevents duplicate saves
-  bool _handledSignedOut = false; //prevent UI errors after logout
+  _NewItemType _itemType = _NewItemType.item;
+  _TshirtSizeGroup _tshirtSizeGroup = _TshirtSizeGroup.adult;
 
-  //image and folder
+  bool _saving = false;
+  bool _closedAfterSave = false;
+  bool _handledSignedOut = false;
+
   String? selectedFolderId;
   XFile? _pickedImage;
 
@@ -67,8 +110,11 @@ class _NewItemScreenState extends State<NewItemScreen> {
     _pickedImage = widget.initialImage;
 
     _sizeCtrls = {
-      for (final s in _sizes) s: TextEditingController(text: '0'),
+      for (final s in <String>[..._adultSizes, ..._kidsSizes])
+        s: TextEditingController(text: '0'),
     };
+
+    _shoeRows.add(_ShoeSizeRow());
 
     _bootstrapFuture = _buildBootstrapForCurrentUser();
 
@@ -99,6 +145,10 @@ class _NewItemScreenState extends State<NewItemScreen> {
       c.dispose();
     }
 
+    for (final row in _shoeRows) {
+      row.dispose();
+    }
+
     super.dispose();
   }
 
@@ -107,25 +157,25 @@ class _NewItemScreenState extends State<NewItemScreen> {
   bool _isAuthOrPermissionError(Object error) {
     final msg = error.toString().toLowerCase();
     return msg.contains(TenantContextService.kSignedOutMessage.toLowerCase()) ||
-        msg.contains("permission-denied") ||
-        msg.contains("permission denied") ||
-        msg.contains("unauthenticated") ||
-        msg.contains("user is not signed in") ||
-        msg.contains("requires authentication") ||
-        msg.contains("user_signed_out") ||
-        msg.contains("user signed out");
+        msg.contains('permission-denied') ||
+        msg.contains('permission denied') ||
+        msg.contains('unauthenticated') ||
+        msg.contains('user is not signed in') ||
+        msg.contains('requires authentication') ||
+        msg.contains('user_signed_out') ||
+        msg.contains('user signed out');
   }
 
   bool _isUnavailableError(Object error) {
     final msg = error.toString().toLowerCase();
-    return msg.contains("cloud_firestore/unavailable") ||
-        msg.contains("service is currently unavailable") ||
-        msg.contains("unable to resolve host") ||
-        msg.contains("firestore.googleapis.com") ||
-        msg.contains("status{code=unavailable") ||
-        msg.contains("unknownhostexception") ||
-        msg.contains("socketexception") ||
-        msg.contains("failed host lookup");
+    return msg.contains('cloud_firestore/unavailable') ||
+        msg.contains('service is currently unavailable') ||
+        msg.contains('unable to resolve host') ||
+        msg.contains('firestore.googleapis.com') ||
+        msg.contains('status{code=unavailable') ||
+        msg.contains('unknownhostexception') ||
+        msg.contains('socketexception') ||
+        msg.contains('failed host lookup');
   }
 
   String _cleanError(Object e) {
@@ -137,7 +187,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
     TopToast.error(context, message);
   }
 
-  //startup loader
   Future<_NewItemBootstrapState> _buildBootstrapForCurrentUser() async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
@@ -146,7 +195,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
 
     final tenantContext = TenantContextService();
 
-    //load profile first try cache and then server
     try {
       Map<String, dynamic>? profile =
       await tenantContext.tryGetCurrentUserProfileCacheOnly();
@@ -155,11 +203,11 @@ class _NewItemScreenState extends State<NewItemScreen> {
 
       if (profile == null) {
         return const _NewItemBootstrapState.error(
-          message: "Failed to load your profile.",
+          message: 'Failed to load your profile.',
         );
       }
 
-      final tenantId = (profile["tenantId"] ?? "").toString().trim();
+      final tenantId = (profile['tenantId'] ?? '').toString().trim();
       if (tenantId.isEmpty) {
         return const _NewItemBootstrapState.missingTenant();
       }
@@ -171,14 +219,12 @@ class _NewItemScreenState extends State<NewItemScreen> {
       }
 
       return _NewItemBootstrapState.error(
-        message: _cleanError(e).isEmpty
-            ? "Failed to load tenant."
-            : _cleanError(e),
+        message:
+        _cleanError(e).isEmpty ? 'Failed to load tenant.' : _cleanError(e),
       );
     }
   }
 
-  //web branch
   Widget _imageWidget(XFile file) {
     if (kIsWeb) {
       return FutureBuilder<Uint8List>(
@@ -199,7 +245,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
       );
     }
 
-    //mobile brunch
     return Image.file(
       File(file.path),
       fit: BoxFit.cover,
@@ -207,7 +252,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
     );
   }
 
-  //build the visual preview box
   Widget _imagePreview() {
     return Container(
       height: 180,
@@ -260,7 +304,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
     }
   }
 
-  //uploads image to firebase storage and returns public download URL
   Future<String> _uploadImageAndGetUrl({
     required String tenantId,
     required String productId,
@@ -300,10 +343,22 @@ class _NewItemScreenState extends State<NewItemScreen> {
     );
   }
 
-  int _totalSizeQty() {
+  List<String> get _activeTshirtSizes {
+    return _tshirtSizeGroup == _TshirtSizeGroup.adult ? _adultSizes : _kidsSizes;
+  }
+
+  int _totalTshirtSizeQty() {
     int total = 0;
-    for (final s in _sizes) {
+    for (final s in _activeTshirtSizes) {
       total += int.tryParse(_sizeCtrls[s]!.text.trim()) ?? 0;
+    }
+    return total;
+  }
+
+  int _totalShoeQty() {
+    int total = 0;
+    for (final row in _shoeRows) {
+      total += int.tryParse(row.qtyCtrl.text.trim()) ?? 0;
     }
     return total;
   }
@@ -316,20 +371,19 @@ class _NewItemScreenState extends State<NewItemScreen> {
   Future<Map<String, String>> _getCurrentUserInfo(String uid) async {
     try {
       final userSnap = await _tryGetDocCacheThenServer(
-        FirebaseFirestore.instance.collection("users").doc(uid),
+        FirebaseFirestore.instance.collection('users').doc(uid),
       );
       final data = userSnap?.data() ?? <String, dynamic>{};
 
       return {
-        "name": (data["name"] ?? "").toString().trim(),
-        "email": (data["email"] ?? "").toString().trim(),
+        'name': (data['name'] ?? '').toString().trim(),
+        'email': (data['email'] ?? '').toString().trim(),
       };
     } catch (_) {
-      return {"name": "", "email": ""};
+      return {'name': '', 'email': ''};
     }
   }
 
-  //runs after the product batch has been committed to finish image syncing
   Future<void> _afterSaveImageSync({
     required String tenantId,
     required String productId,
@@ -433,20 +487,21 @@ class _NewItemScreenState extends State<NewItemScreen> {
     int initialStock = 0;
     Map<String, int>? sizeStock;
     Map<String, int>? sizeDelta;
+    String? sizeGroup;
 
-    if (!_isTshirt) {
+    if (_itemType == _NewItemType.item) {
       final q = int.tryParse(qtyCtrl.text.trim()) ?? 0;
       if (q <= 0) {
         _showErrorToast('Quantity must be greater than 0.');
         return null;
       }
       initialStock = q;
-    } else {
+    } else if (_itemType == _NewItemType.tshirt) {
       final parsed = <String, int>{};
       bool anyPositive = false;
       bool anyInvalid = false;
 
-      for (final s in _sizes) {
+      for (final s in _activeTshirtSizes) {
         final raw = _sizeCtrls[s]!.text.trim();
         final n = raw.isEmpty ? 0 : (int.tryParse(raw) ?? -1);
 
@@ -472,11 +527,75 @@ class _NewItemScreenState extends State<NewItemScreen> {
         return null;
       }
 
+      sizeGroup = _tshirtSizeGroup == _TshirtSizeGroup.adult ? 'adult' : 'kids';
       sizeStock = parsed;
       initialStock = parsed.values.fold<int>(0, (a, b) => a + b);
       sizeDelta = {
-        for (final s in _sizes) s: parsed[s] ?? 0,
+        for (final s in _activeTshirtSizes) s: parsed[s] ?? 0,
       };
+    } else {
+      final parsed = <String, int>{};
+      bool anyPositive = false;
+      bool anyInvalid = false;
+      bool anyMissingSize = false;
+      bool anyDuplicateSize = false;
+      final seenSizes = <String>{};
+
+      for (final row in _shoeRows) {
+        final size = row.sizeCtrl.text.trim();
+        final rawQty = row.qtyCtrl.text.trim();
+        final qty = rawQty.isEmpty ? 0 : (int.tryParse(rawQty) ?? -1);
+
+        if (size.isEmpty && qty <= 0) {
+          continue;
+        }
+
+        if (size.isEmpty && qty > 0) {
+          anyMissingSize = true;
+          continue;
+        }
+
+        if (qty < 0) {
+          anyInvalid = true;
+          continue;
+        }
+
+        final normalizedSize = size.toLowerCase();
+        if (seenSizes.contains(normalizedSize)) {
+          anyDuplicateSize = true;
+        }
+        seenSizes.add(normalizedSize);
+
+        parsed[size] = qty;
+
+        if (qty > 0) {
+          anyPositive = true;
+        }
+      }
+
+      if (anyMissingSize) {
+        _showErrorToast('Enter a size for every shoe quantity.');
+        return null;
+      }
+
+      if (anyInvalid) {
+        _showErrorToast('Shoe quantities must be valid whole numbers.');
+        return null;
+      }
+
+      if (anyDuplicateSize) {
+        _showErrorToast('Each shoe size can only be added once.');
+        return null;
+      }
+
+      if (!anyPositive) {
+        _showErrorToast('Enter at least one shoe size quantity greater than 0.');
+        return null;
+      }
+
+      sizeStock = parsed;
+      initialStock = parsed.values.fold<int>(0, (a, b) => a + b);
+      sizeDelta = Map<String, int>.from(parsed);
     }
 
     return _CreateItemData(
@@ -489,7 +608,9 @@ class _NewItemScreenState extends State<NewItemScreen> {
       costPrice: _parseDouble(costCtrl),
       wholesalePrice: _parseDouble(wholesaleCtrl),
       retailPrice: _parseDouble(retailCtrl),
-      isTshirt: _isTshirt,
+      itemType: _itemType.name,
+      isTshirt: _itemType == _NewItemType.tshirt,
+      sizeGroup: sizeGroup,
     );
   }
 
@@ -513,9 +634,8 @@ class _NewItemScreenState extends State<NewItemScreen> {
 
       final fs = FirebaseFirestore.instance;
       final userInfo = await _getCurrentUserInfo(uid);
-      final userName = userInfo["name"]!.isEmpty ? "" : userInfo["name"]!;
+      final userName = userInfo['name']!.isEmpty ? '' : userInfo['name']!;
 
-      //generates a new firestore doc with auto ID
       final productRef = fs
           .collection('tenants')
           .doc(tenantId)
@@ -524,7 +644,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
 
       final productId = productRef.id;
 
-      //save image locally
       if (!kIsWeb) {
         await _saveOfflineLocalImage(
           tenantId: tenantId,
@@ -536,7 +655,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
       final now = DateTime.now();
       final nowYear = now.year;
 
-      //build product data
       final Map<String, dynamic> productData = {
         'code': prepared.code,
         'minStockLevel': 5,
@@ -546,17 +664,18 @@ class _NewItemScreenState extends State<NewItemScreen> {
         'createdBy': uid,
         'createdByName': userName,
         'updatedAt': FieldValue.serverTimestamp(),
+        'itemType': prepared.itemType,
         'isTshirt': prepared.isTshirt,
+        if (prepared.sizeGroup != null) 'sizeGroup': prepared.sizeGroup,
         'stockQuantity': prepared.initialStock,
         'hasPendingImageUpload': true,
-        if (prepared.isTshirt) 'sizeStock': prepared.sizeStock,
+        if (prepared.sizeStock != null) 'sizeStock': prepared.sizeStock,
       };
 
       final batch = fs.batch();
 
       batch.set(productRef, productData);
 
-      //prices sub collection
       batch.set(
         productRef.collection('prices').doc('cost'),
         {
@@ -581,14 +700,13 @@ class _NewItemScreenState extends State<NewItemScreen> {
         },
       );
 
-      //stock year document
       batch.set(
         productRef.collection('stock_years').doc(nowYear.toString()),
         {
           'year': nowYear,
           'initialStock': prepared.initialStock,
           'currentStock': prepared.initialStock,
-          if (prepared.isTshirt) 'currentSizeStock': prepared.sizeStock,
+          if (prepared.sizeStock != null) 'currentSizeStock': prepared.sizeStock,
           'createdAt': FieldValue.serverTimestamp(),
           'createdBy': uid,
           'createdByName': userName,
@@ -596,7 +714,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
         },
       );
 
-      //stock movement document
       final movementRef = productRef.collection('stock_movements').doc();
       batch.set(
         movementRef,
@@ -608,7 +725,7 @@ class _NewItemScreenState extends State<NewItemScreen> {
           'by': uid,
           'byName': userName,
           'note': 'Initial stock on item creation',
-          if (prepared.isTshirt) 'sizeDelta': prepared.sizeDelta,
+          if (prepared.sizeDelta != null) 'sizeDelta': prepared.sizeDelta,
         },
       );
 
@@ -624,7 +741,6 @@ class _NewItemScreenState extends State<NewItemScreen> {
         Navigator.of(context).pop(true);
       }
 
-      //continue in background the saving
       unawaited(
         batchFuture.then((_) {
           return _afterSaveImageSync(
@@ -658,6 +774,8 @@ class _NewItemScreenState extends State<NewItemScreen> {
   }
 
   Widget _sizeStockTableEditor() {
+    final activeSizes = _activeTshirtSizes;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -672,15 +790,17 @@ class _NewItemScreenState extends State<NewItemScreen> {
         const SizedBox(height: 10),
         LayoutBuilder(
           builder: (context, constraints) {
-            final double cellWidth = (constraints.maxWidth - (8 * 3)) / 4;
+            final int columnCount = activeSizes.length <= 6 ? 4 : 4;
+            final double cellWidth =
+                (constraints.maxWidth - (8 * (columnCount - 1))) / columnCount;
 
             return Wrap(
               spacing: 8,
               runSpacing: 10,
-              children: _sizes.map((s) {
+              children: activeSizes.map((s) {
                 final ctrl = _sizeCtrls[s]!;
                 return SizedBox(
-                  width: cellWidth.clamp(62.0, 90.0),
+                  width: cellWidth.clamp(62.0, 105.0).toDouble(),
                   child: Column(
                     children: [
                       Text(
@@ -737,7 +857,7 @@ class _NewItemScreenState extends State<NewItemScreen> {
         Align(
           alignment: Alignment.centerLeft,
           child: Text(
-            'Total: ${_totalSizeQty()}',
+            'Total: ${_totalTshirtSizeQty()}',
             style: TextStyle(color: Colors.grey.shade700),
           ),
         ),
@@ -745,7 +865,156 @@ class _NewItemScreenState extends State<NewItemScreen> {
     );
   }
 
-  //build the radio button for item type
+  Widget _tshirtAdultKidsToggle() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 6),
+        const Text(
+          'Size Type',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        SegmentedButton<_TshirtSizeGroup>(
+          segments: const [
+            ButtonSegment<_TshirtSizeGroup>(
+              value: _TshirtSizeGroup.adult,
+              label: Text('Adult'),
+            ),
+            ButtonSegment<_TshirtSizeGroup>(
+              value: _TshirtSizeGroup.kids,
+              label: Text('Kids'),
+            ),
+          ],
+          selected: {_tshirtSizeGroup},
+          onSelectionChanged: (selection) {
+            if (!mounted || selection.isEmpty) return;
+            setState(() => _tshirtSizeGroup = selection.first);
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _shoeSizeTableEditor() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 10),
+        const Text(
+          'Shoe Sizes',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: const [
+            Expanded(
+              flex: 2,
+              child: Text(
+                'Size',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            SizedBox(width: 10),
+            Expanded(
+              flex: 2,
+              child: Text(
+                'Qty',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+            SizedBox(width: 42),
+          ],
+        ),
+        const SizedBox(height: 6),
+        ...List.generate(_shoeRows.length, (index) {
+          final row = _shoeRows[index];
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 2,
+                  child: TextField(
+                    controller: row.sizeCtrl,
+                    textInputAction: TextInputAction.next,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      hintText: 'e.g. 38',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: TextField(
+                    controller: row.qtyCtrl,
+                    keyboardType: TextInputType.number,
+                    textAlign: TextAlign.center,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                    onTap: () {
+                      if (row.qtyCtrl.text.trim() == '0') {
+                        row.qtyCtrl.clear();
+                      }
+                    },
+                    onChanged: (_) {
+                      if (mounted) setState(() {});
+                    },
+                    onEditingComplete: () {
+                      if (row.qtyCtrl.text.trim().isEmpty) {
+                        row.qtyCtrl.text = '0';
+                      }
+                      FocusScope.of(context).unfocus();
+                      if (mounted) setState(() {});
+                    },
+                    onTapOutside: (_) {
+                      if (row.qtyCtrl.text.trim().isEmpty) {
+                        row.qtyCtrl.text = '0';
+                      }
+                      if (mounted) setState(() {});
+                    },
+                  ),
+                ),
+                SizedBox(
+                  width: 42,
+                  child: IconButton(
+                    tooltip: 'Remove size',
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: _shoeRows.length == 1
+                        ? null
+                        : () {
+                      final removed = _shoeRows.removeAt(index);
+                      removed.dispose();
+                      if (mounted) setState(() {});
+                    },
+                  ),
+                ),
+              ],
+            ),
+          );
+        }),
+        TextButton.icon(
+          onPressed: () {
+            setState(() => _shoeRows.add(_ShoeSizeRow()));
+          },
+          icon: const Icon(Icons.add),
+          label: const Text('Add size'),
+        ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            'Total: ${_totalShoeQty()}',
+            style: TextStyle(color: Colors.grey.shade700),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _itemTypeSelector() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -761,31 +1030,50 @@ class _NewItemScreenState extends State<NewItemScreen> {
           ),
         ),
         const SizedBox(height: 6),
-        Row(
+        Wrap(
+          spacing: 4,
+          runSpacing: 0,
           children: [
-            Expanded(
-              child: RadioListTile<bool>(
-                value: false,
-                groupValue: _isTshirt,
+            SizedBox(
+              width: 130,
+              child: RadioListTile<_NewItemType>(
+                value: _NewItemType.item,
+                groupValue: _itemType,
                 onChanged: (v) {
-                  if (!mounted) return;
-                  setState(() => _isTshirt = v ?? false);
+                  if (!mounted || v == null) return;
+                  setState(() => _itemType = v);
                 },
-                title: const Text('Normal item'),
+                title: const Text('Item'),
                 dense: true,
                 visualDensity: VisualDensity.compact,
                 contentPadding: EdgeInsets.zero,
               ),
             ),
-            Expanded(
-              child: RadioListTile<bool>(
-                value: true,
-                groupValue: _isTshirt,
+            SizedBox(
+              width: 145,
+              child: RadioListTile<_NewItemType>(
+                value: _NewItemType.tshirt,
+                groupValue: _itemType,
                 onChanged: (v) {
-                  if (!mounted) return;
-                  setState(() => _isTshirt = v ?? true);
+                  if (!mounted || v == null) return;
+                  setState(() => _itemType = v);
                 },
                 title: const Text('T-Shirt'),
+                dense: true,
+                visualDensity: VisualDensity.compact,
+                contentPadding: EdgeInsets.zero,
+              ),
+            ),
+            SizedBox(
+              width: 130,
+              child: RadioListTile<_NewItemType>(
+                value: _NewItemType.shoes,
+                groupValue: _itemType,
+                onChanged: (v) {
+                  if (!mounted || v == null) return;
+                  setState(() => _itemType = v);
+                },
+                title: const Text('Shoes'),
                 dense: true,
                 visualDensity: VisualDensity.compact,
                 contentPadding: EdgeInsets.zero,
@@ -797,13 +1085,37 @@ class _NewItemScreenState extends State<NewItemScreen> {
     );
   }
 
+  Widget _stockInputSection(String tenantId) {
+    if (_itemType == _NewItemType.item) {
+      return TextField(
+        controller: qtyCtrl,
+        keyboardType: TextInputType.number,
+        textInputAction: TextInputAction.done,
+        decoration: const InputDecoration(labelText: 'Quantity'),
+        onSubmitted: (_) => createItem(tenantId),
+      );
+    }
+
+    if (_itemType == _NewItemType.tshirt) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _tshirtAdultKidsToggle(),
+          _sizeStockTableEditor(),
+        ],
+      );
+    }
+
+    return _shoeSizeTableEditor();
+  }
+
   AppBar _buildAppBar() {
     return AppBar(
       title: const Text(
         'Add Item',
         style: TextStyle(color: Colors.white),
       ),
-      backgroundColor: const Color(0xff0B1E40),
+      backgroundColor: _appColor,
       iconTheme: const IconThemeData(color: Colors.white),
       leading: IconButton(
         icon: const Icon(Icons.arrow_back, color: Colors.white),
@@ -842,10 +1154,13 @@ class _NewItemScreenState extends State<NewItemScreen> {
       resizeToAvoidBottomInset: true,
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: EdgeInsets.fromLTRB( 20, 20, 20,
+          padding: EdgeInsets.fromLTRB(
+            20,
+            20,
+            20,
             20 + MediaQuery.of(context).viewInsets.bottom,
           ),
-          child: AbsorbPointer( //the form becomes non-interactive
+          child: AbsorbPointer(
             absorbing: _saving,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -888,8 +1203,7 @@ class _NewItemScreenState extends State<NewItemScreen> {
                   keyboardType: const TextInputType.numberWithOptions(
                     decimal: true,
                   ),
-                  decoration:
-                  const InputDecoration(labelText: 'Wholesale Price'),
+                  decoration: const InputDecoration(labelText: 'Wholesale Price'),
                 ),
                 TextField(
                   controller: retailCtrl,
@@ -901,21 +1215,12 @@ class _NewItemScreenState extends State<NewItemScreen> {
                 ),
                 const SizedBox(height: 10),
                 _itemTypeSelector(),
-                if (!_isTshirt)
-                  TextField(
-                    controller: qtyCtrl,
-                    keyboardType: TextInputType.number,
-                    textInputAction: TextInputAction.done,
-                    decoration: const InputDecoration(labelText: 'Quantity'),
-                    onSubmitted: (_) => createItem(tenantId),
-                  )
-                else
-                  _sizeStockTableEditor(),
+                _stockInputSection(tenantId),
                 const SizedBox(height: 25),
                 ElevatedButton(
                   onPressed: _saving ? null : () => createItem(tenantId),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xff0B1E40),
+                    backgroundColor: _appColor,
                     minimumSize: const Size(double.infinity, 50),
                   ),
                   child: _saving
@@ -997,15 +1302,12 @@ class _NewItemScreenState extends State<NewItemScreen> {
   }
 }
 
-//state model for startup and loading status
 class _NewItemBootstrapState {
-  //fields
   final String? tenantId;
   final bool isSignedOut;
   final bool isMissingTenant;
   final String? message;
 
-  //private constructor
   const _NewItemBootstrapState._({
     required this.tenantId,
     required this.isSignedOut,
@@ -1013,7 +1315,6 @@ class _NewItemBootstrapState {
     required this.message,
   });
 
-  //ready state
   const _NewItemBootstrapState.ready({
     required String tenantId,
   }) : this._(
@@ -1048,11 +1349,9 @@ class _NewItemBootstrapState {
     message: message,
   );
 
-  //getter
   bool get isReady => tenantId != null && tenantId!.trim().isNotEmpty;
 }
 
-//hold already validated form data
 class _CreateItemData {
   final String code;
   final String folderId;
@@ -1063,7 +1362,9 @@ class _CreateItemData {
   final double costPrice;
   final double wholesalePrice;
   final double retailPrice;
+  final String itemType;
   final bool isTshirt;
+  final String? sizeGroup;
 
   const _CreateItemData({
     required this.code,
@@ -1075,6 +1376,8 @@ class _CreateItemData {
     required this.costPrice,
     required this.wholesalePrice,
     required this.retailPrice,
+    required this.itemType,
     required this.isTshirt,
+    required this.sizeGroup,
   });
 }

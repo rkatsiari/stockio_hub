@@ -229,6 +229,25 @@ class _AdminUserOrdersScreenState extends State<AdminUserOrdersScreen> {
     }).toList();
   }
 
+
+  String _formatOrderDate(dynamic value) {
+    DateTime? date;
+
+    if (value is Timestamp) {
+      date = value.toDate();
+    } else if (value is DateTime) {
+      date = value;
+    }
+
+    if (date == null) return "";
+
+    final day = date.day.toString().padLeft(2, "0");
+    final month = date.month.toString().padLeft(2, "0");
+    final year = date.year.toString();
+
+    return "$day/$month/$year";
+  }
+
   //loading scaffold - used when tenant is loading
   Widget _buildLoadingScaffold(String title) {
     return Scaffold(
@@ -411,6 +430,11 @@ class _AdminUserOrdersScreenState extends State<AdminUserOrdersScreen> {
                                 final data = d.data();
 
                                 final name = (data["name"] ?? "Untitled").toString(); //if missing file show untitled
+                                final createdDate = _formatOrderDate(data["createdAt"]);
+                                final titleText = createdDate.isEmpty
+                                    ? name
+                                    : "$name • $createdDate";
+
                                 //status flags
                                 final isActive = data["isActive"] == true;
                                 final isExported = data["isExported"] == true;
@@ -431,18 +455,10 @@ class _AdminUserOrdersScreenState extends State<AdminUserOrdersScreen> {
                                   icon = Icons.history;
                                 }
 
-                                final ownerLabel = (data["userName"] ?? "").toString().trim();
-
-                                final subtitle = widget.userId == null
-                                    ? (ownerLabel.isEmpty
-                                    ? status
-                                    : "$status • $ownerLabel")
-                                    : status;
-
                                 return ListTile(
                                   leading: Icon(icon),
-                                  title: Text(name),
-                                  subtitle: Text(subtitle),
+                                  title: Text(titleText),
+                                  subtitle: Text(status),
                                   trailing: const Icon( //indicate navigation
                                     Icons.arrow_forward_ios,
                                     size: 16,

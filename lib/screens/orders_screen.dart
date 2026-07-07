@@ -11,6 +11,59 @@ import 'manage_shops_screen.dart';
 import 'order_details_screen.dart';
 import 'shop_orders_screen.dart';
 
+
+Set<String>? _parseVisibleShopIdsFromData(Map<String, dynamic> data) {
+  if (!data.containsKey("visibleShopIds")) return null;
+
+  final raw = data["visibleShopIds"];
+  if (raw == null) return <String>{};
+
+  if (raw is Iterable) {
+    return raw
+        .map((e) => e.toString().trim())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+  }
+
+  return <String>{};
+}
+
+Future<Set<String>?> _loadVisibleShopIdsForCurrentUser({
+  required String tenantId,
+  required String uid,
+}) async {
+  final fs = FirebaseFirestore.instance;
+  final refs = <DocumentReference<Map<String, dynamic>>>[
+    fs.collection("tenants").doc(tenantId).collection("users").doc(uid),
+    fs.collection("users").doc(uid),
+  ];
+
+  for (final ref in refs) {
+    try {
+      final cached = await ref
+          .get(const GetOptions(source: Source.cache))
+          .timeout(const Duration(milliseconds: 500));
+      final data = cached.data();
+      if (cached.exists && data != null && data.containsKey("visibleShopIds")) {
+        return _parseVisibleShopIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  for (final ref in refs) {
+    try {
+      final server = await ref.get().timeout(const Duration(milliseconds: 1500));
+      final data = server.data();
+      if (server.exists && data != null && data.containsKey("visibleShopIds")) {
+        return _parseVisibleShopIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  // Missing visibleShopIds means all shops are visible by default.
+  return null;
+}
+
 class OrdersScreen extends StatefulWidget {
   const OrdersScreen({super.key});
 
@@ -85,9 +138,18 @@ class _OrdersScreenState extends State<OrdersScreen> {
         return const _OrdersBootstrapState.missingTenant();
       }
 
+      final canSeeAllShops = resolvedRole == "admin" || resolvedRole == "storage_manager";
+      final visibleShopIds = canSeeAllShops
+          ? null
+          : await _loadVisibleShopIdsForCurrentUser(
+        tenantId: resolvedTenantId,
+        uid: user.uid,
+      );
+
       return _OrdersBootstrapState.ready(
         tenantId: resolvedTenantId,
         role: resolvedRole,
+        visibleShopIds: visibleShopIds,
       );
     } catch (e) {
       if (_isAuthOrPermissionError(e)) {
@@ -244,9 +306,10 @@ class _OrdersScreenState extends State<OrdersScreen> {
         }
 
         return _OrdersContent(
-          key: ValueKey<String>('orders-${state.tenantId}-${state.role}'),
+          key: ValueKey<String>('orders-${state.tenantId}-${state.role}-${state.visibleShopIds?.length ?? -1}'),
           tenantId: state.tenantId!,
           role: state.role!,
+          visibleShopIds: state.visibleShopIds,
         );
       },
     );
@@ -256,6 +319,7 @@ class _OrdersScreenState extends State<OrdersScreen> {
 class _OrdersBootstrapState {
   final String? tenantId;
   final String? role;
+  final Set<String>? visibleShopIds;
   final bool isSignedOut;
   final bool isMissingTenant;
   final String? message;
@@ -263,6 +327,7 @@ class _OrdersBootstrapState {
   const _OrdersBootstrapState._({
     required this.tenantId,
     required this.role,
+    required this.visibleShopIds,
     required this.isSignedOut,
     required this.isMissingTenant,
     required this.message,
@@ -271,9 +336,11 @@ class _OrdersBootstrapState {
   const _OrdersBootstrapState.ready({
     required String tenantId,
     required String role,
+    required Set<String>? visibleShopIds,
   }) : this._(
     tenantId: tenantId,
     role: role,
+    visibleShopIds: visibleShopIds,
     isSignedOut: false,
     isMissingTenant: false,
     message: null,
@@ -283,6 +350,7 @@ class _OrdersBootstrapState {
       : this._(
     tenantId: null,
     role: null,
+    visibleShopIds: null,
     isSignedOut: true,
     isMissingTenant: false,
     message: null,
@@ -292,6 +360,7 @@ class _OrdersBootstrapState {
       : this._(
     tenantId: null,
     role: null,
+    visibleShopIds: null,
     isSignedOut: false,
     isMissingTenant: true,
     message: null,
@@ -302,6 +371,7 @@ class _OrdersBootstrapState {
   }) : this._(
     tenantId: null,
     role: null,
+    visibleShopIds: null,
     isSignedOut: false,
     isMissingTenant: false,
     message: message,
@@ -313,11 +383,13 @@ class _OrdersBootstrapState {
 class _OrdersContent extends StatefulWidget {
   final String tenantId;
   final String role;
+  final Set<String>? visibleShopIds;
 
   const _OrdersContent({
     super.key,
     required this.tenantId,
     required this.role,
+    required this.visibleShopIds,
   });
 
   @override
@@ -333,7 +405,15 @@ class _OrdersContentState extends State<_OrdersContent> {
   bool get _isAdmin => widget.role == "admin";
   bool get _isStorageManager => widget.role == "storage_manager";
   bool get _canViewAllOrders => _isStorageManager;
+  bool get _canSeeAllShops => _isAdmin || _isStorageManager || widget.visibleShopIds == null;
   bool get _canCreateOrders => !_isStorageManager;
+
+  bool _canSeeShopId(String? shopId) {
+    if (_canSeeAllShops) return true;
+    final id = (shopId ?? "").trim();
+    if (id.isEmpty) return false;
+    return widget.visibleShopIds!.contains(id);
+  }
 
   @override
   void initState() {
@@ -441,7 +521,7 @@ class _OrdersContentState extends State<_OrdersContent> {
       child: TextField(
         onChanged: (v) => setState(() => searchQuery = v.trim().toLowerCase()),
         decoration: InputDecoration(
-          hintText: "Search shops by name...",
+          hintText: "Search shops...",
           prefixIcon: const Icon(Icons.search),
           filled: true,
           border: OutlineInputBorder(
@@ -470,6 +550,11 @@ class _OrdersContentState extends State<_OrdersContent> {
       return;
     }
 
+    if (!_canSeeAllShops && (widget.visibleShopIds?.isEmpty ?? true)) {
+      _toast("You do not have permission to create orders for any shop.", error: true);
+      return;
+    }
+
     try {
       final activeQuery = _ordersCol(tenantId)
           .where("userId", isEqualTo: uid)
@@ -491,8 +576,14 @@ class _OrdersContentState extends State<_OrdersContent> {
 
       if (!mounted || _isSignedOut() || _handledSignedOut) return;
 
-      final shops =
+      final allShops =
           shopsSnap?.docs ?? const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+      final shops = allShops.where((d) => _canSeeShopId(d.id)).toList();
+
+      if (allShops.isNotEmpty && shops.isEmpty) {
+        _toast("You do not have permission to create orders for any shop.", error: true);
+        return;
+      }
 
       String orderName = "";
       String? selectedShopId;
@@ -779,7 +870,7 @@ class _OrdersContentState extends State<_OrdersContent> {
                         );
                       }
 
-                      final docs = snap.data!.docs;
+                      final docs = snap.data!.docs.where((d) => _canSeeShopId(d.id)).toList();
 
                       final filtered = docs.where((d) {
                         final data = d.data();
@@ -796,7 +887,7 @@ class _OrdersContentState extends State<_OrdersContent> {
                             docs.isEmpty
                                 ? (_isAdmin
                                 ? "No shops yet. Add one from the top-right store icon."
-                                : "No shops yet. Ask an admin to add shops.")
+                                : "No shops are available for your account.")
                                 : "No matching shops",
                           ),
                         );

@@ -10,6 +10,7 @@ import '../widgets/bottom_nav.dart';
 import 'admin_users_screen.dart';
 import 'login_screen.dart';
 import 'manage_users_screen.dart';
+import 'manage_users_folders_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -19,7 +20,6 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
-  //state variables
   late final StreamSubscription<User?> _authSub;
 
   final TenantContextService _tenantContextService = TenantContextService();
@@ -149,7 +149,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       setState(() => _isLoggingOut = true);
     }
 
-    //sign out and navigate
     try {
       await FirebaseAuth.instance.signOut();
 
@@ -183,7 +182,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(radius),
       ),
-      onTap: _isLoggingOut //when logging out the tile is disable
+      onTap: _isLoggingOut
           ? null
           : () {
         FocusManager.instance.primaryFocus?.unfocus();
@@ -241,7 +240,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  //generic message UI
   Widget _buildMessageScaffold({
     required IconData icon,
     required String title,
@@ -342,7 +340,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       borderRadius: BorderRadius.circular(cardRadius),
                     ),
                     padding: EdgeInsets.all(isTablet ? 24 : 18),
-                    //profile card
                     child: Column(
                       children: [
                         CircleAvatar(
@@ -369,7 +366,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ],
                     ),
                   ),
-                  //admin only buttons
                   SizedBox(height: sectionGap),
                   if (role == "admin") ...[
                     _actionTile(
@@ -401,9 +397,24 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         );
                       },
                     ),
+                    const SizedBox(height: 10),
+                    _actionTile(
+                      title: "Manage User Folders",
+                      radius: tileRadius,
+                      fontSize: tileFont,
+                      verticalPadding: tileVerticalPadding,
+                      onTap: () {
+                        if (!mounted) return;
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) =>
+                            const ManageUsersFoldersScreen(),
+                          ),
+                        );
+                      },
+                    ),
                     SizedBox(height: sectionGap),
                   ],
-                  //logout button
                   ElevatedButton(
                     onPressed: _isLoggingOut ? null : logout,
                     style: ElevatedButton.styleFrom(
@@ -449,10 +460,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
           return _buildLoadingScaffold();
         }
 
-        //default fall back state
-        final state = snapshot.data ?? const _ProfileBootstrapState.error(
-          message: "Unable to load profile.",
-        );
+        final state = snapshot.data ??
+            const _ProfileBootstrapState.error(
+              message: "Unable to load profile.",
+            );
 
         if (_isLoggingOut) {
           return _buildMessageScaffold(

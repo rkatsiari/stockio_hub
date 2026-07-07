@@ -215,6 +215,25 @@ class _ShopOrdersScreenState extends State<ShopOrdersScreen> {
         : "No orders found for this shop";
   }
 
+
+  String _formatOrderDate(dynamic value) {
+    DateTime? date;
+
+    if (value is Timestamp) {
+      date = value.toDate();
+    } else if (value is DateTime) {
+      date = value;
+    }
+
+    if (date == null) return "";
+
+    final day = date.day.toString().padLeft(2, "0");
+    final month = date.month.toString().padLeft(2, "0");
+    final year = date.year.toString();
+
+    return "$day/$month/$year";
+  }
+
   Widget _buildSignedOutScaffold(String title) {
     return Scaffold(
       appBar: AppBar(
@@ -372,6 +391,8 @@ class _ShopOrdersScreenState extends State<ShopOrdersScreen> {
                         final data = d.data();
 
                         final name = (data["name"] ?? "Untitled").toString();
+                        final createdDate = _formatOrderDate(data["createdAt"]);
+
                         final isActive = data["isActive"] == true;
                         final isExported = data["isExported"] == true;
 
@@ -399,7 +420,11 @@ class _ShopOrdersScreenState extends State<ShopOrdersScreen> {
                         final shopName =
                         (data["shopName"] ?? "").toString().trim();
                         final showShop =
-                            widget.shopId == null && shopName.isNotEmpty;
+                            _canSeeAllOrders && widget.shopId == null && shopName.isNotEmpty;
+
+                        final titleText = createdDate.isEmpty
+                            ? name
+                            : "$name • $createdDate";
 
                         final parts = <String>[
                           status,
@@ -409,7 +434,7 @@ class _ShopOrdersScreenState extends State<ShopOrdersScreen> {
 
                         return ListTile(
                           leading: Icon(icon),
-                          title: Text(name),
+                          title: Text(titleText),
                           subtitle: Text(parts.join(" • ")),
                           trailing: const Icon(
                             Icons.arrow_forward_ios,

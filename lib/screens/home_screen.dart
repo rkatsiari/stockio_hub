@@ -25,7 +25,20 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
+class _ExportProgressState {
+  final double progress;
+  final String text;
+
+  const _ExportProgressState({
+    this.progress = 0.0,
+    this.text = "",
+  });
+}
+
 class _HomeScreenState extends State<HomeScreen> {
+  static final Map<String, Map<String, dynamic>> _insightsMemoryCache =
+  <String, Map<String, dynamic>>{};
+
   final TenantContextService _tenantContextService = TenantContextService();
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
@@ -63,6 +76,21 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _exportingProfit = false;
   bool _exportingStock = false;
 
+  //export progress shown in the Exports section
+  final ValueNotifier<_ExportProgressState> _exportProgressNotifier =
+  ValueNotifier<_ExportProgressState>(const _ExportProgressState());
+
+  //keeps insights from reloading when only export progress changes
+  String? _insightsFutureKey;
+  Future<Map<String, dynamic>>? _insightsFuture;
+  Map<String, dynamic>? _lastInsightsData;
+
+  //tracks when the current insights future was kicked off, so a cached
+  //result for the same tenant/month can expire and refresh instead of
+  //staying stale for the lifetime of the screen
+  DateTime? _insightsFutureStartedAt;
+  static const Duration _insightsCacheTtl = Duration(minutes: 2);
+
   //loading flags
   bool _loadingTenant = true;
   bool _isAdmin = false;
@@ -75,19 +103,97 @@ class _HomeScreenState extends State<HomeScreen> {
   final Map<String, Uint8List?> _imageCache = {};
   final Map<String, String> _userNameCache = {};
 
-  static const List<String> _sizes = [
+  static const List<String> _adultTshirtSizes = [
     "XXS", "XS", "S", "M",
     "L", "XL", "2XL", "3XL",
+  ];
+
+  static const List<String> _kidsTshirtSizes = [
+    "1-2", "3-4", "5-6", "7-8", "9-10", "11-12",
   ];
 
   //excel layout constants
   static const int _picPx = 100;
   static const double _headerRowH = 28;
-  static const double _normalRowH = 84;
-  static const double _tshirtRowH = 18;
+  static const double _normalRowH = 100;
+  static const double _sizedItemRowH = 18;
 
   static const String _euroFmt = '€#,##0.00';
   static const String _qtyFmt = '0';
+
+  Map<String, dynamic> _asStringDynamicMap(dynamic value) {
+    if (value is Map) {
+      return value.map(
+            (key, val) => MapEntry(key.toString().trim(), val),
+      )..removeWhere((key, _) => key.isEmpty);
+    }
+    return <String, dynamic>{};
+  }
+
+  String _normalizeSizeKey(String value) {
+    return value.trim().toUpperCase();
+  }
+
+  String _productItemType(Map<String, dynamic> data) {
+    final raw = (data["itemType"] ?? "").toString().trim().toLowerCase();
+    if (raw == "item" || raw == "tshirt" || raw == "shoes") return raw;
+
+    // Backwards compatibility for products created before itemType existed.
+    if ((data["isTshirt"] ?? false) == true) return "tshirt";
+
+    final sizeStock = _asStringDynamicMap(data["sizeStock"]);
+    if (sizeStock.isNotEmpty) return "shoes";
+
+    return "item";
+  }
+
+  bool _isSizedProduct(Map<String, dynamic> data) {
+    final type = _productItemType(data);
+    return type == "tshirt" || type == "shoes";
+  }
+
+  List<String> _sizeLabelsForProduct(
+      Map<String, dynamic> data, {
+        Iterable<String> extraSizes = const <String>[],
+      }) {
+    final type = _productItemType(data);
+    final labels = <String>[];
+    final seen = <String>{};
+
+    void addSize(String value) {
+      final clean = value.trim();
+      if (clean.isEmpty) return;
+      final key = _normalizeSizeKey(clean);
+      if (seen.add(key)) labels.add(clean);
+    }
+
+    if (type == "tshirt") {
+      final sizeGroup =
+      (data["sizeGroup"] ?? "adult").toString().trim().toLowerCase();
+      final baseSizes = sizeGroup == "kids" ? _kidsTshirtSizes : _adultTshirtSizes;
+      for (final size in baseSizes) {
+        addSize(size);
+      }
+    } else if (type == "shoes") {
+      final sizeStock = _asStringDynamicMap(data["sizeStock"]);
+      for (final size in sizeStock.keys) {
+        addSize(size);
+      }
+    }
+
+    // Fallback/repair path: include any saved sizeStock keys and any sizes found in
+    // orders or stock movements, so exports do not lose custom shoe sizes.
+    final sizeStock = _asStringDynamicMap(data["sizeStock"]);
+    for (final size in sizeStock.keys) {
+      addSize(size);
+    }
+
+    for (final size in extraSizes) {
+      addSize(size);
+    }
+
+    return labels;
+  }
 
   @override
   void initState() {
@@ -98,6 +204,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _authSub?.cancel();
+    _exportProgressNotifier.dispose();
     super.dispose(); //avoid memory leaks
   }
 
@@ -148,6 +255,11 @@ class _HomeScreenState extends State<HomeScreen> {
           _exporting = false;
           _exportingProfit = false;
           _exportingStock = false;
+          _exportProgressNotifier.value = const _ExportProgressState();
+          _insightsFutureKey = null;
+          _insightsFuture = null;
+          _insightsFutureStartedAt = null;
+          _lastInsightsData = null;
         });
         return;
       }
@@ -160,6 +272,10 @@ class _HomeScreenState extends State<HomeScreen> {
         _exportShopId = null;
         _exportShopName = "All";
         _isAdmin = false;
+        _insightsFutureKey = null;
+        _insightsFuture = null;
+        _insightsFutureStartedAt = null;
+        _lastInsightsData = null;
       });
 
       await _loadTenantAndAdmin(token);
@@ -418,6 +534,19 @@ class _HomeScreenState extends State<HomeScreen> {
     required List<int> bytes,
     required String shareText,
   }) async {
+    //clean up temp export folders left behind by earlier exports so they
+    //don't accumulate in app storage over time
+    try {
+      final entries = Directory.systemTemp.listSync();
+      for (final entity in entries) {
+        if (entity is Directory && entity.path.contains("ims_exports_")) {
+          try {
+            await entity.delete(recursive: true);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
     final dir = await Directory.systemTemp.createTemp("ims_exports_");
     final file = File("${dir.path}/$filename");
     await file.writeAsBytes(bytes, flush: true);
@@ -699,13 +828,39 @@ class _HomeScreenState extends State<HomeScreen> {
     required bool exporting,
     required bool profit,
     required bool stock,
+    double? progress,
+    String? progressText,
   }) {
     if (!mounted) return;
+
+    if (!exporting) {
+      _exportProgressNotifier.value = const _ExportProgressState();
+    } else if (progress != null || progressText != null) {
+      final current = _exportProgressNotifier.value;
+      _exportProgressNotifier.value = _ExportProgressState(
+        progress: (progress ?? current.progress).clamp(0.0, 1.0),
+        text: progressText ?? current.text,
+      );
+    }
+
     setState(() {
       _exporting = exporting;
       _exportingProfit = profit;
       _exportingStock = stock;
     });
+  }
+
+  //progress helper so long exports still update only the progress UI
+  Future<void> _updateExportProgress(double progress, String text) async {
+    if (!mounted) return;
+
+    _exportProgressNotifier.value = _ExportProgressState(
+      progress: progress.clamp(0.0, 1.0),
+      text: text,
+    );
+
+    //give Flutter one frame to repaint the progress indicator
+    await Future<void>.delayed(Duration.zero);
   }
 
   //profit excel export
@@ -718,10 +873,17 @@ class _HomeScreenState extends State<HomeScreen> {
     final canExport = await _ensureInternetForExport();
     if (!canExport) return;
 
-    _setExportState(exporting: true, profit: true, stock: false);
+    _setExportState(
+      exporting: true,
+      profit: true,
+      stock: false,
+      progress: 0.0,
+      progressText: "Preparing profit export...",
+    );
 
     try {
       final fs = _firestore;
+      await _updateExportProgress(0.05, "Loading exported orders...");
 
       final yearStart = DateTime(_exportYear, 1, 1);
       final yearEnd = DateTime(_exportYear + 1, 1, 1);
@@ -740,6 +902,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       final ordersSnap = await q.get();
+      await _updateExportProgress(0.15, "Reading order items...");
 
       final Map<String, double> qtyByProductId = {};
 
@@ -760,6 +923,8 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
 
+      await _updateExportProgress(0.35, "Loading products...");
+
       //info toast for no data
       if (qtyByProductId.isEmpty) {
         _setExportState(exporting: false, profit: false, stock: false);
@@ -776,6 +941,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final productDocs = await Future.wait(
         productIds.map((id) => _tenantProductsRef(tenantId).doc(id).get()),
       );
+      await _updateExportProgress(0.45, "Downloading product images...");
 
       for (final pDoc in productDocs) {
         final p = pDoc.data() ?? {};
@@ -810,6 +976,8 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       //create workbook and sheet
+      await _updateExportProgress(0.75, "Building Excel workbook...");
+
       final workbook = xlsio.Workbook();
       final sheet = workbook.worksheets[0];
       sheet.name = "Profit";
@@ -962,6 +1130,8 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
 
+      await _updateExportProgress(0.90, "Saving Excel file...");
+
       final bytes = workbook.saveAsStream();
       workbook.dispose();
 
@@ -974,12 +1144,19 @@ class _HomeScreenState extends State<HomeScreen> {
       //filename of profit export
       final filename = "profit_${safeTypeFile}_${safeShopFile}_$_exportYear.xlsx";
 
+      await _updateExportProgress(0.97, "Opening share menu...");
+
       await _shareFile(
         filename: filename,
         bytes: bytes,
         shareText:
         "Profit export (${_profitExportTypeLabels[_profitExportType] ?? "Total"} • $safeShop • $_exportYear)",
       );
+
+      await _updateExportProgress(1.0, "Profit export ready.");
+      //brief pause so the "ready" message is actually visible before the
+      //progress indicator is hidden by _setExportState below
+      await Future<void>.delayed(const Duration(milliseconds: 600));
 
       _setExportState(exporting: false, profit: false, stock: false);
       if (mounted) {
@@ -1001,16 +1178,24 @@ class _HomeScreenState extends State<HomeScreen> {
     final canExport = await _ensureInternetForExport();
     if (!canExport) return;
 
-    _setExportState(exporting: true, profit: false, stock: true);
+    _setExportState(
+      exporting: true,
+      profit: false,
+      stock: true,
+      progress: 0.0,
+      progressText: "Preparing stock export...",
+    );
 
     try {
       final fs = _firestore;
+      await _updateExportProgress(0.05, "Loading products...");
 
       final yearStart = DateTime(_exportYear, 1, 1);
       final yearEnd = DateTime(_exportYear + 1, 1, 1);
 
       final productsSnap = await _tenantProductsRef(tenantId).get();
       final products = productsSnap.docs;
+      await _updateExportProgress(0.15, "Checking product data...");
 
       if (products.isEmpty) {
         _setExportState(exporting: false, profit: false, stock: false);
@@ -1022,6 +1207,8 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         return;
       }
+
+      await _updateExportProgress(0.25, "Downloading product images...");
 
       //preload product images
       for (final p in products) {
@@ -1045,6 +1232,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       final ordersSnap = await oq.get();
+      await _updateExportProgress(0.40, "Reading exported order items...");
 
       final Map<String, double> soldByProduct = {};
       final Map<String, double> soldByProductSize = {};
@@ -1062,12 +1250,11 @@ class _HomeScreenState extends State<HomeScreen> {
               : double.tryParse("${x["qty"]}") ?? 0.0;
           if (qty <= 0) continue;
 
-          final bool isTshirt = (x["isTshirt"] ?? false) == true;
-          final sizeRaw = (x["size"] ?? "").toString().trim().toUpperCase();
+          final sizeRaw = (x["size"] ?? "").toString().trim();
+          final sizeKey = _normalizeSizeKey(sizeRaw);
 
-          if (isTshirt && sizeRaw.isNotEmpty) {
-            //key format for t-shirts
-            final key = "$productId|$sizeRaw";
+          if (sizeKey.isNotEmpty) {
+            final key = "$productId|$sizeKey";
             soldByProductSize[key] = (soldByProductSize[key] ?? 0) + qty;
           } else {
             soldByProduct[productId] = (soldByProduct[productId] ?? 0) + qty;
@@ -1075,11 +1262,18 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
 
+      await _updateExportProgress(0.50, "Reading stock movements...");
+
       final Map<String, double> addedByProduct = {};
       final Map<String, double> addedByProductSize = {};
 
       //read stock movements (add,adjust,undo)
-      Future<void> readProductMovements(String productId, bool isTshirt) async {
+      Future<void> readProductMovements(
+          String productId,
+          Map<String, dynamic> productData,
+          ) async {
+        final isSized = _isSizedProduct(productData);
+
         final movesSnap = await _firestore
             .collection("tenants")
             .doc(tenantId)
@@ -1098,48 +1292,48 @@ class _HomeScreenState extends State<HomeScreen> {
               type == "add" || type == "adjust" || type.startsWith("undo");
           if (!countsAsAdded) continue;
 
-          if (!isTshirt) {
+          final sizeDeltaRaw = _asStringDynamicMap(m["sizeDelta"]);
+
+          if (isSized && sizeDeltaRaw.isNotEmpty) {
+            for (final entry in sizeDeltaRaw.entries) {
+              final sz = _normalizeSizeKey(entry.key);
+              if (sz.isEmpty) continue;
+
+              final v = entry.value;
+              final d =
+              (v is num) ? v.toDouble() : double.tryParse("$v") ?? 0.0;
+              if (d == 0) continue;
+
+              final key = "$productId|$sz";
+              addedByProductSize[key] = (addedByProductSize[key] ?? 0) + d;
+            }
+          } else {
             final delta = (m["delta"] is num)
                 ? (m["delta"] as num).toDouble()
                 : double.tryParse("${m["delta"]}") ?? 0.0;
 
             if (delta == 0) continue;
             addedByProduct[productId] = (addedByProduct[productId] ?? 0) + delta;
-          } else {
-            final sizeDeltaRaw = (m["sizeDelta"] as Map?)?.cast<String, dynamic>();
-            if (sizeDeltaRaw != null && sizeDeltaRaw.isNotEmpty) {
-              for (final entry in sizeDeltaRaw.entries) {
-                final sz = entry.key.toString().trim().toUpperCase();
-                final v = entry.value;
-                final d =
-                (v is num) ? v.toDouble() : double.tryParse("$v") ?? 0.0;
-                if (d == 0) continue;
-
-                final key = "$productId|$sz";
-                addedByProductSize[key] = (addedByProductSize[key] ?? 0) + d;
-              }
-            } else {
-              final delta = (m["delta"] is num)
-                  ? (m["delta"] as num).toDouble()
-                  : double.tryParse("${m["delta"]}") ?? 0.0;
-              if (delta == 0) continue;
-              addedByProduct[productId] = (addedByProduct[productId] ?? 0) + delta;
-            }
           }
         }
       }
 
       for (final p in products) {
-        final pd = p.data();
-        final isTshirt = (pd["isTshirt"] ?? false) == true;
-        await readProductMovements(p.id, isTshirt);
+        await readProductMovements(p.id, p.data());
       }
+
+      await _updateExportProgress(0.65, "Reading opening stock...");
 
       final Map<String, double> openingByProduct = {};
       final Map<String, double> openingByProductSize = {};
 
       //get opening stock
-      Future<void> readOpening(String productId, bool isTshirt) async {
+      Future<void> readOpening(
+          String productId,
+          Map<String, dynamic> productData,
+          ) async {
+        final isSized = _isSizedProduct(productData);
+
         final yDoc = await _firestore
             .collection("tenants")
             .doc(tenantId)
@@ -1151,6 +1345,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
         if (!yDoc.exists) {
           openingByProduct[productId] = 0;
+
+          if (isSized) {
+            final productSizeStock = _asStringDynamicMap(productData["sizeStock"]);
+            for (final entry in productSizeStock.entries) {
+              final sz = _normalizeSizeKey(entry.key);
+              if (sz.isEmpty) continue;
+              final v = entry.value;
+              final d =
+              (v is num) ? v.toDouble() : double.tryParse("$v") ?? 0.0;
+              openingByProductSize["$productId|$sz"] = d;
+            }
+          }
           return;
         }
 
@@ -1161,27 +1367,35 @@ class _HomeScreenState extends State<HomeScreen> {
 
         openingByProduct[productId] = init;
 
-        if (isTshirt) {
-          final initSizeRaw =
-          (y["initialSizeStock"] as Map?)?.cast<String, dynamic>();
-          if (initSizeRaw != null && initSizeRaw.isNotEmpty) {
-            for (final entry in initSizeRaw.entries) {
-              final sz = entry.key.toString().trim().toUpperCase();
-              final v = entry.value;
-              final d =
-              (v is num) ? v.toDouble() : double.tryParse("$v") ?? 0.0;
-              final key = "$productId|$sz";
-              openingByProductSize[key] = d;
-            }
+        if (isSized) {
+          final initSizeRaw = _asStringDynamicMap(y["initialSizeStock"]);
+          final currentSizeRaw = _asStringDynamicMap(y["currentSizeStock"]);
+          final productSizeRaw = _asStringDynamicMap(productData["sizeStock"]);
+
+          final effectiveSizeStock = initSizeRaw.isNotEmpty
+              ? initSizeRaw
+              : currentSizeRaw.isNotEmpty
+              ? currentSizeRaw
+              : productSizeRaw;
+
+          for (final entry in effectiveSizeStock.entries) {
+            final sz = _normalizeSizeKey(entry.key);
+            if (sz.isEmpty) continue;
+
+            final v = entry.value;
+            final d =
+            (v is num) ? v.toDouble() : double.tryParse("$v") ?? 0.0;
+            final key = "$productId|$sz";
+            openingByProductSize[key] = d;
           }
         }
       }
 
       for (final p in products) {
-        final pd = p.data();
-        final isTshirt = (pd["isTshirt"] ?? false) == true;
-        await readOpening(p.id, isTshirt);
+        await readOpening(p.id, p.data());
       }
+
+      await _updateExportProgress(0.75, "Building Excel workbook...");
 
       final workbook = xlsio.Workbook();
       final sheet = workbook.worksheets[0];
@@ -1222,24 +1436,47 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final rows = <Map<String, dynamic>>[];
 
+      Iterable<String> sizeKeysFromMap(
+          String productId,
+          Map<String, double> source,
+          ) sync* {
+        final prefix = "$productId|";
+        for (final key in source.keys) {
+          if (key.startsWith(prefix)) {
+            final size = key.substring(prefix.length).trim();
+            if (size.isNotEmpty) yield size;
+          }
+        }
+      }
+
       for (final p in products) {
         final pd = p.data();
         final productId = p.id;
         final code = (pd["code"] ?? productId).toString().trim();
-        final isTshirt = (pd["isTshirt"] ?? false) == true;
+        final isSized = _isSizedProduct(pd);
         final imageUrl = (pd["imageUrl"] ?? "").toString().trim();
 
         final cost = await _getPrice(fs, tenantId, productId, "cost");
         final wholesale = await _getPrice(fs, tenantId, productId, "wholesale");
 
-        if (!isTshirt) {
+        final extraSizes = <String>[
+          ...sizeKeysFromMap(productId, openingByProductSize),
+          ...sizeKeysFromMap(productId, addedByProductSize),
+          ...sizeKeysFromMap(productId, soldByProductSize),
+        ];
+
+        final sizeLabels = isSized
+            ? _sizeLabelsForProduct(pd, extraSizes: extraSizes)
+            : <String>[];
+
+        if (!isSized || sizeLabels.isEmpty) {
           final opening = openingByProduct[productId] ?? 0;
           final added = addedByProduct[productId] ?? 0;
           final sold = soldByProduct[productId] ?? 0;
           final closing = opening + added - sold;
 
           rows.add({
-            "isTshirt": false,
+            "isSizedItem": false,
             "productId": productId,
             "code": code,
             "size": "",
@@ -1250,10 +1487,12 @@ class _HomeScreenState extends State<HomeScreen> {
             "cost": cost,
             "wholesale": wholesale,
             "imageUrl": imageUrl,
+            "sizeOrder": 0,
           });
         } else {
-          for (final sz in _sizes) {
-            final key = "$productId|$sz";
+          for (int sizeIndex = 0; sizeIndex < sizeLabels.length; sizeIndex++) {
+            final sz = sizeLabels[sizeIndex];
+            final key = "$productId|${_normalizeSizeKey(sz)}";
 
             final openingSz = openingByProductSize[key] ?? 0.0;
             final addedSz = addedByProductSize[key] ?? 0.0;
@@ -1261,7 +1500,7 @@ class _HomeScreenState extends State<HomeScreen> {
             final closingSz = openingSz + addedSz - soldSz;
 
             rows.add({
-              "isTshirt": true,
+              "isSizedItem": true,
               "productId": productId,
               "code": code,
               "size": sz,
@@ -1272,13 +1511,24 @@ class _HomeScreenState extends State<HomeScreen> {
               "cost": cost,
               "wholesale": wholesale,
               "imageUrl": imageUrl,
+              "sizeOrder": sizeIndex,
             });
           }
         }
       }
 
-      //sort with code
-      rows.sort((a, b) => (a["code"] as String).compareTo(b["code"] as String));
+      //sort with code and keep each product's saved size order
+      rows.sort((a, b) {
+        final codeCompare = (a["code"] as String).compareTo(b["code"] as String);
+        if (codeCompare != 0) return codeCompare;
+
+        final productCompare = (a["productId"] as String).compareTo(b["productId"] as String);
+        if (productCompare != 0) return productCompare;
+
+        final aOrder = (a["sizeOrder"] is num) ? (a["sizeOrder"] as num).toInt() : 0;
+        final bOrder = (b["sizeOrder"] is num) ? (b["sizeOrder"] as num).toInt() : 0;
+        return aOrder.compareTo(bOrder);
+      });
 
       int row = 2;
       int i = 0;
@@ -1286,9 +1536,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
       while (i < rows.length) {
         final r = rows[i];
-        final bool isTshirt = r["isTshirt"] == true;
+        final bool isSizedItem = r["isSizedItem"] == true;
 
-        if (!isTshirt) {
+        if (!isSizedItem) {
           sheet.getRangeByIndex(row, 1).rowHeight = _normalRowH;
 
           final imageUrl = (r["imageUrl"] ?? "").toString();
@@ -1336,33 +1586,53 @@ class _HomeScreenState extends State<HomeScreen> {
           continue;
         }
 
-        //tshirt block
+        //same block layout for all sized items: adult T-shirts, kids T-shirts, and shoes
         final productId = (r["productId"] ?? "").toString();
         final startRow = row;
 
         final block = <Map<String, dynamic>>[];
         while (i < rows.length) {
           final rr = rows[i];
-          if (rr["isTshirt"] != true) break;
+          if (rr["isSizedItem"] != true) break;
           if ((rr["productId"] ?? "").toString() != productId) break;
           block.add(rr);
           i++;
         }
 
         final endRow = startRow + block.length - 1;
+        final fitPhotoRowHeight = _picPx / block.length;
+        final sizedRowHeight = block.length == 1
+            ? _normalRowH
+            : (fitPhotoRowHeight > _sizedItemRowH
+            ? fitPhotoRowHeight
+            : _sizedItemRowH);
 
         for (int rr = startRow; rr <= endRow; rr++) {
-          sheet.getRangeByIndex(rr, 1).rowHeight = _tshirtRowH;
+          sheet.getRangeByIndex(rr, 1).rowHeight = sizedRowHeight;
         }
 
-        final imgRange = sheet.getRangeByIndex(startRow, 1, endRow, 1)..merge();
-        final codeRange = sheet.getRangeByIndex(startRow, 2, endRow, 2)..merge();
-        final costRange = sheet.getRangeByIndex(startRow, 8, endRow, 8)..merge();
-        final whRange = sheet.getRangeByIndex(startRow, 9, endRow, 9)..merge();
-        final totalCostRange =
-        sheet.getRangeByIndex(startRow, 10, endRow, 10)..merge();
-        final totalWhRange =
-        sheet.getRangeByIndex(startRow, 11, endRow, 11)..merge();
+        xlsio.Range imgRange;
+        xlsio.Range codeRange;
+        xlsio.Range costRange;
+        xlsio.Range whRange;
+        xlsio.Range totalCostRange;
+        xlsio.Range totalWhRange;
+
+        if (endRow > startRow) {
+          imgRange = sheet.getRangeByIndex(startRow, 1, endRow, 1)..merge();
+          codeRange = sheet.getRangeByIndex(startRow, 2, endRow, 2)..merge();
+          costRange = sheet.getRangeByIndex(startRow, 8, endRow, 8)..merge();
+          whRange = sheet.getRangeByIndex(startRow, 9, endRow, 9)..merge();
+          totalCostRange = sheet.getRangeByIndex(startRow, 10, endRow, 10)..merge();
+          totalWhRange = sheet.getRangeByIndex(startRow, 11, endRow, 11)..merge();
+        } else {
+          imgRange = sheet.getRangeByIndex(startRow, 1);
+          codeRange = sheet.getRangeByIndex(startRow, 2);
+          costRange = sheet.getRangeByIndex(startRow, 8);
+          whRange = sheet.getRangeByIndex(startRow, 9);
+          totalCostRange = sheet.getRangeByIndex(startRow, 10);
+          totalWhRange = sheet.getRangeByIndex(startRow, 11);
+        }
 
         for (final rng in [
           imgRange,
@@ -1467,6 +1737,8 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
 
+      await _updateExportProgress(0.90, "Saving Excel file...");
+
       final bytes = workbook.saveAsStream();
       workbook.dispose();
 
@@ -1475,11 +1747,18 @@ class _HomeScreenState extends State<HomeScreen> {
       final safeShopFile = safeShop.replaceAll(RegExp(r'[\\/:*?"<>|]'), "_");
       final filename = "stock_${safeShopFile}_$_exportYear.xlsx";
 
+      await _updateExportProgress(0.97, "Opening share menu...");
+
       await _shareFile(
         filename: filename,
         bytes: bytes,
         shareText: "Stock export ($safeShop • $_exportYear)",
       );
+
+      await _updateExportProgress(1.0, "Stock export ready.");
+      //brief pause so the "ready" message is actually visible before the
+      //progress indicator is hidden by _setExportState below
+      await Future<void>.delayed(const Duration(milliseconds: 600));
 
       _setExportState(exporting: false, profit: false, stock: false);
       if (mounted) {
@@ -1535,6 +1814,67 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
       ],
+    );
+  }
+
+  Widget _exportProgressIndicator() {
+    if (!_exporting) return const SizedBox.shrink();
+
+    final title = _exportingProfit
+        ? "Preparing profit export"
+        : _exportingStock
+        ? "Preparing stock export"
+        : "Preparing export";
+
+    return ValueListenableBuilder<_ExportProgressState>(
+      valueListenable: _exportProgressNotifier,
+      builder: (context, value, _) {
+        final progress = value.progress.clamp(0.0, 1.0);
+        final percent = (progress * 100).round().clamp(0, 100);
+
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xffF3F6FB),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2.5),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                  Text(
+                    "$percent%",
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              LinearProgressIndicator(value: progress),
+              if (value.text.trim().isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  value.text,
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -1847,6 +2187,106 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<Map<String, dynamic>> _getInsightsFuture(String tenantId) {
+    final key = "$tenantId|$_dashYear|$_dashMonth";
+
+    final isStale = _insightsFutureStartedAt == null ||
+        DateTime.now().difference(_insightsFutureStartedAt!) >
+            _insightsCacheTtl;
+
+    if (_insightsFutureKey != key || _insightsFuture == null || isStale) {
+      _insightsFutureKey = key;
+      _insightsFutureStartedAt = DateTime.now();
+
+      final cached = _insightsMemoryCache[key];
+      if (cached != null) {
+        _lastInsightsData = cached;
+      }
+
+      _insightsFuture = _computeInsights(tenantId).then((data) {
+        _insightsMemoryCache[key] = data;
+        _lastInsightsData = data;
+        return data;
+      });
+    }
+
+    return _insightsFuture!;
+  }
+
+  Widget _buildInsightsContent(Map<String, dynamic> data) {
+    final fast = (data["fastMovingTop10"] as List?) ?? [];
+    final top5 = (data["top5"] as List?) ?? [];
+    final trend = (data["trend"] as List?) ?? [];
+    final orderCount = data["orderCount"] ?? 0;
+
+    Widget listBlock(String label, List items, int max) {
+      if (items.isEmpty) return Text("$label: No sales in this month.");
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: const TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 6),
+          ...items.take(max).map((x) {
+            final m = (x as Map).cast<String, dynamic>();
+            final code = (m["code"] ?? "").toString();
+            final key = (m["productId"] ?? m["key"] ?? "").toString();
+            final qty = m["qty"] ?? 0;
+            final folderPath = _formatPathNames(m["folderPathNames"]);
+            final labelName = code.isNotEmpty ? code : key;
+            final orderCount = m["orderCount"] ?? 0;
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Text(
+                label.contains("Fast-Moving")
+                    ? "• $labelName — in $orderCount orders, $qty sold  ($folderPath)"
+                    : "• $labelName — $qty sold, in $orderCount orders  ($folderPath)",
+              ),
+            );
+          }),
+        ],
+      );
+    }
+
+    Widget trendBlock() {
+      if (trend.isEmpty) return const Text("Trend: No data.");
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            "Monthly Sales Trend (Revenue)",
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 6),
+          ...trend.map((t) {
+            final m = (t as Map).cast<String, dynamic>();
+            final label = (m["label"] ?? "").toString();
+            final revenue =
+            (m["revenue"] is num) ? (m["revenue"] as num).toDouble() : 0.0;
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Text("• $label — €${revenue.toStringAsFixed(2)}"),
+            );
+          }),
+        ],
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text("Orders in month: $orderCount"),
+        const SizedBox(height: 10),
+        listBlock("Fast-Moving Products (Top 10)", fast, 10),
+        const SizedBox(height: 12),
+        listBlock("Top 5 Best Sellers", top5, 5),
+        const SizedBox(height: 12),
+        trendBlock(),
+      ],
+    );
+  }
+
   //insight widget
   Widget _insights() {
     final tenantId = _tenantId;
@@ -1854,98 +2294,27 @@ class _HomeScreenState extends State<HomeScreen> {
       return const Text("No tenant loaded.");
     }
 
-    //error, loading, no data states
+    final future = _getInsightsFuture(tenantId);
+    final initialInsightsData = _lastInsightsData;
+
     return FutureBuilder<Map<String, dynamic>>(
-      future: _computeInsights(tenantId),
+      future: future,
+      initialData: initialInsightsData,
       builder: (context, snap) {
+        if (snap.hasData) {
+          return _buildInsightsContent(snap.data!);
+        }
+
         if (snap.hasError) {
           return const Text("Could not load insights right now.");
         }
 
-        if (snap.connectionState != ConnectionState.done) {
-          return const SizedBox(
-            height: 80,
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text("Loading insights..."),
-            ),
-          );
-        }
-
-        if (!snap.hasData) return const Text("No data.");
-
-        //result data
-        final data = snap.data!;
-        final fast = (data["fastMovingTop10"] as List?) ?? [];
-        final top5 = (data["top5"] as List?) ?? [];
-        final trend = (data["trend"] as List?) ?? [];
-        final orderCount = data["orderCount"] ?? 0;
-
-        Widget listBlock(String label, List items, int max) {
-          if (items.isEmpty) return Text("$label: No sales in this month.");
-
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(label, style: const TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 6),
-              ...items.take(max).map((x) {
-                final m = (x as Map).cast<String, dynamic>();
-                final code = (m["code"] ?? "").toString();
-                final key = (m["productId"] ?? m["key"] ?? "").toString();
-                final qty = m["qty"] ?? 0;
-                final folderPath = _formatPathNames(m["folderPathNames"]);
-                final labelName = code.isNotEmpty ? code : key;
-                final orderCount = m["orderCount"] ?? 0;
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Text(
-                    label.contains("Fast-Moving")
-                        ? "• $labelName — in $orderCount orders, $qty sold  ($folderPath)"
-                        : "• $labelName — $qty sold, in $orderCount orders  ($folderPath)",
-                  ),
-                );
-              }),
-            ],
-          );
-        }
-
-        Widget trendBlock() {
-          if (trend.isEmpty) return const Text("Trend: No data.");
-
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                "Monthly Sales Trend (Revenue)",
-                style: TextStyle(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 6),
-              ...trend.map((t) {
-                final m = (t as Map).cast<String, dynamic>();
-                final label = (m["label"] ?? "").toString();
-                final revenue =
-                (m["revenue"] is num) ? (m["revenue"] as num).toDouble() : 0.0;
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Text("• $label — €${revenue.toStringAsFixed(2)}"),
-                );
-              }),
-            ],
-          );
-        }
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text("Orders in month: $orderCount"),
-            const SizedBox(height: 10),
-            listBlock("Fast-Moving Products (Top 10)", fast, 10),
-            const SizedBox(height: 12),
-            listBlock("Top 5 Best Sellers", top5, 5),
-            const SizedBox(height: 12),
-            trendBlock(),
-          ],
+        return const SizedBox(
+          height: 80,
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text("Loading insights..."),
+          ),
         );
       },
     );
@@ -2059,27 +2428,8 @@ class _HomeScreenState extends State<HomeScreen> {
           child: _dashMonthYearPicker(),
         ),
         _sectionCard(
-          title: "Exports",
-          actions: [
-            TextButton.icon(
-              icon: const Icon(Icons.share),
-              label: Text(_exportingProfit ? "Exporting..." : "Profit"),
-              onPressed: _exporting ? null : _exportProfitXlsx,
-            ),
-            const SizedBox(width: 6),
-            TextButton.icon(
-              icon: const Icon(Icons.inventory_2),
-              label: Text(_exportingStock ? "Exporting..." : "Stock"),
-              onPressed: _exporting ? null : _exportStockXlsx,
-            ),
-          ],
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _exportsShopYearPicker(),
-              const SizedBox(height: 12),
-            ],
-          ),
+          title: "Insights",
+          child: _insights(),
         ),
         _sectionCard(
           title: "Movement History",
@@ -2099,8 +2449,28 @@ class _HomeScreenState extends State<HomeScreen> {
           child: _movementHistoryPreview(),
         ),
         _sectionCard(
-          title: "Insights",
-          child: _insights(),
+          title: "Exports",
+          actions: [
+            TextButton.icon(
+              icon: const Icon(Icons.share),
+              label: Text(_exportingProfit ? "Exporting..." : "Profit"),
+              onPressed: _exporting ? null : _exportProfitXlsx,
+            ),
+            const SizedBox(width: 6),
+            TextButton.icon(
+              icon: const Icon(Icons.inventory_2),
+              label: Text(_exportingStock ? "Exporting..." : "Stock"),
+              onPressed: _exporting ? null : _exportStockXlsx,
+            ),
+          ],
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _exportsShopYearPicker(),
+              const SizedBox(height: 12),
+              _exportProgressIndicator(),
+            ],
+          ),
         ),
       ],
     );

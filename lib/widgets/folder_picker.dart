@@ -9,6 +9,9 @@ class FolderPicker extends StatefulWidget {
   //don't show folder itself and descendants
   final String? excludeFolderId;
 
+  //don't show multiple folders and their descendants
+  final Set<String> excludeFolderIds;
+
   //don't show current parent of this folder
   final String? excludeParentOfFolderId;
 
@@ -24,6 +27,7 @@ class FolderPicker extends StatefulWidget {
     this.preselectedFolder,
     required this.onFolderSelected,
     this.excludeFolderId,
+    this.excludeFolderIds = const <String>{},
     this.excludeParentOfFolderId,
     this.currentFolderId,
     this.allowTopLevel = true,
@@ -70,6 +74,14 @@ class _FolderPickerState extends State<FolderPicker> {
       if (widget.excludeFolderId != null && widget.excludeFolderId!.isNotEmpty) {
         blocked.addAll(
           await _collectDescendantsIncludingSelf(widget.excludeFolderId!),
+        );
+      }
+
+      for (final folderId in widget.excludeFolderIds) {
+        final cleanId = folderId.trim();
+        if (cleanId.isEmpty) continue;
+        blocked.addAll(
+          await _collectDescendantsIncludingSelf(cleanId),
         );
       }
 

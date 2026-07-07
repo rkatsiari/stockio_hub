@@ -1,15 +1,12 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
-import 'package:path_provider/path_provider.dart';
 
+import '../services/last_items_screen_service.dart';
 import '../services/offline_media_service.dart';
 import '../services/tenant_context_service.dart';
 import '../utils/folder_paths.dart';
@@ -19,18 +16,136 @@ import '../widgets/folder_grid_tile.dart';
 import '../widgets/folder_picker.dart';
 import '../widgets/offline_image_widget.dart';
 import '../widgets/top_toast.dart';
+import 'files_screen.dart';
 import 'item_details_pager_screen.dart';
 import 'new_folder_screen.dart';
 import 'new_item_screen.dart';
 
+Set<String>? _parseVisibleFolderIdsFromData(Map<String, dynamic> data) {
+  if (!data.containsKey("visibleFolderIds")) return null;
+
+  final raw = data["visibleFolderIds"];
+  if (raw == null) return null;
+
+  if (raw is Iterable) {
+    return raw
+        .map((e) => e.toString().trim())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+  }
+
+  return null;
+}
+
+Future<Set<String>?> _loadVisibleFolderIdsForCurrentUser({
+  required String tenantId,
+  required String uid,
+  required Map<String, dynamic> profile,
+}) async {
+  if (profile.containsKey("visibleFolderIds")) {
+    return _parseVisibleFolderIdsFromData(profile);
+  }
+
+  final fs = FirebaseFirestore.instance;
+  final refs = <DocumentReference<Map<String, dynamic>>>[
+    fs.collection("tenants").doc(tenantId).collection("users").doc(uid),
+    fs.collection("users").doc(uid),
+  ];
+
+  for (final ref in refs) {
+    try {
+      final cached = await ref
+          .get(const GetOptions(source: Source.cache))
+          .timeout(const Duration(milliseconds: 500));
+      final data = cached.data();
+      if (cached.exists && data != null && data.containsKey("visibleFolderIds")) {
+        return _parseVisibleFolderIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  for (final ref in refs) {
+    try {
+      final server = await ref.get().timeout(const Duration(milliseconds: 1500));
+      final data = server.data();
+      if (server.exists && data != null && data.containsKey("visibleFolderIds")) {
+        return _parseVisibleFolderIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  // Missing/null visibleFolderIds means all folders are visible by default.
+  return null;
+}
+
+
+Set<String>? _parseVisibleShopIdsFromData(Map<String, dynamic> data) {
+  if (!data.containsKey("visibleShopIds")) return null;
+
+  final raw = data["visibleShopIds"];
+  if (raw == null) return <String>{};
+
+  if (raw is Iterable) {
+    return raw
+        .map((e) => e.toString().trim())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+  }
+
+  return <String>{};
+}
+
+Future<Set<String>?> _loadVisibleShopIdsForCurrentUser({
+  required String tenantId,
+  required String uid,
+  required Map<String, dynamic> profile,
+}) async {
+  if (profile.containsKey("visibleShopIds")) {
+    return _parseVisibleShopIdsFromData(profile);
+  }
+
+  final fs = FirebaseFirestore.instance;
+  final refs = <DocumentReference<Map<String, dynamic>>>[
+    fs.collection("tenants").doc(tenantId).collection("users").doc(uid),
+    fs.collection("users").doc(uid),
+  ];
+
+  for (final ref in refs) {
+    try {
+      final cached = await ref
+          .get(const GetOptions(source: Source.cache))
+          .timeout(const Duration(milliseconds: 500));
+      final data = cached.data();
+      if (cached.exists && data != null && data.containsKey("visibleShopIds")) {
+        return _parseVisibleShopIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  for (final ref in refs) {
+    try {
+      final server = await ref.get().timeout(const Duration(milliseconds: 1500));
+      final data = server.data();
+      if (server.exists && data != null && data.containsKey("visibleShopIds")) {
+        return _parseVisibleShopIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  // Missing visibleShopIds means all shops are visible by default.
+  return null;
+}
+
 class ItemsScreen extends StatefulWidget {
   final String folderId;
   final String folderName;
+  final String? highlightedItemId;
 
   const ItemsScreen({
     super.key,
     required this.folderId,
     required this.folderName,
+    this.highlightedItemId,
   });
 
   @override
@@ -46,6 +161,10 @@ class _ItemsScreenState extends State<ItemsScreen> {
   @override
   void initState() {
     super.initState();
+    LastItemsScreenService.remember(
+      folderId: widget.folderId,
+      folderName: widget.folderName,
+    );
     _currentUser = FirebaseAuth.instance.currentUser;
     _bootstrapFuture = _buildBootstrapForUser(_currentUser);
 
@@ -108,9 +227,29 @@ class _ItemsScreenState extends State<ItemsScreen> {
         return const _ItemsBootstrapState.missingTenant();
       }
 
+      final canSeeAllFolders = role == "admin" || role == "storage_manager";
+      final visibleFolderIds = canSeeAllFolders
+          ? null
+          : await _loadVisibleFolderIdsForCurrentUser(
+        tenantId: tenantId,
+        uid: user.uid,
+        profile: profile,
+      );
+
+      final canSeeAllShops = role == "admin" || role == "storage_manager";
+      final visibleShopIds = canSeeAllShops
+          ? null
+          : await _loadVisibleShopIdsForCurrentUser(
+        tenantId: tenantId,
+        uid: user.uid,
+        profile: profile,
+      );
+
       return _ItemsBootstrapState.ready(
         tenantId: tenantId,
         role: role,
+        visibleFolderIds: visibleFolderIds,
+        visibleShopIds: visibleShopIds,
       );
     } catch (e) {
       if (_isAuthOrPermissionError(e)) {
@@ -141,9 +280,16 @@ class _ItemsScreenState extends State<ItemsScreen> {
           icon: const Icon(Icons.arrow_back, color: Colors.white),
           onPressed: () {
             if (!mounted) return;
-            if (Navigator.of(context).canPop()) {
-              Navigator.of(context).pop();
+
+            final navigator = Navigator.of(context);
+            if (navigator.canPop()) {
+              navigator.pop();
+              return;
             }
+
+            navigator.pushReplacement(
+              MaterialPageRoute(builder: (_) => const FilesScreen()),
+            );
           },
         ),
       ),
@@ -152,6 +298,7 @@ class _ItemsScreenState extends State<ItemsScreen> {
         currentIndex: 1,
         hasFab: false,
         isRootScreen: false,
+        filesButtonOpensMainFiles: true,
       )
           : null,
       body: body,
@@ -278,12 +425,15 @@ class _ItemsScreenState extends State<ItemsScreen> {
 
         return _ItemsContent(
           key: ValueKey<String>(
-            'items-${state.tenantId}-${widget.folderId}-${state.role}',
+            'items-${state.tenantId}-${widget.folderId}-${state.role}-${state.visibleFolderIds?.length ?? -1}-${widget.highlightedItemId ?? ""}',
           ),
           tenantId: state.tenantId!,
           folderId: widget.folderId,
           folderName: widget.folderName,
           role: state.role,
+          visibleFolderIds: state.visibleFolderIds,
+          visibleShopIds: state.visibleShopIds,
+          highlightedItemId: widget.highlightedItemId,
         );
       },
     );
@@ -294,6 +444,8 @@ class _ItemsScreenState extends State<ItemsScreen> {
 class _ItemsBootstrapState {
   final String? tenantId;
   final String role;
+  final Set<String>? visibleFolderIds;
+  final Set<String>? visibleShopIds;
   final bool isSignedOut;
   final bool isMissingTenant;
   final String? message;
@@ -301,6 +453,8 @@ class _ItemsBootstrapState {
   const _ItemsBootstrapState._({
     required this.tenantId,
     required this.role,
+    required this.visibleFolderIds,
+    required this.visibleShopIds,
     required this.isSignedOut,
     required this.isMissingTenant,
     required this.message,
@@ -309,9 +463,13 @@ class _ItemsBootstrapState {
   const _ItemsBootstrapState.ready({
     required String tenantId,
     required String role,
+    required Set<String>? visibleFolderIds,
+    required Set<String>? visibleShopIds,
   })  : this._(
     tenantId: tenantId,
     role: role,
+    visibleFolderIds: visibleFolderIds,
+    visibleShopIds: visibleShopIds,
     isSignedOut: false,
     isMissingTenant: false,
     message: null,
@@ -321,6 +479,8 @@ class _ItemsBootstrapState {
       : this._(
     tenantId: null,
     role: "",
+    visibleFolderIds: null,
+    visibleShopIds: null,
     isSignedOut: true,
     isMissingTenant: false,
     message: null,
@@ -330,6 +490,8 @@ class _ItemsBootstrapState {
       : this._(
     tenantId: null,
     role: "",
+    visibleFolderIds: null,
+    visibleShopIds: null,
     isSignedOut: false,
     isMissingTenant: true,
     message: null,
@@ -340,6 +502,8 @@ class _ItemsBootstrapState {
   })  : this._(
     tenantId: null,
     role: "",
+    visibleFolderIds: null,
+    visibleShopIds: null,
     isSignedOut: false,
     isMissingTenant: false,
     message: message,
@@ -354,6 +518,9 @@ class _ItemsContent extends StatefulWidget {
   final String folderId;
   final String folderName;
   final String role;
+  final Set<String>? visibleFolderIds;
+  final Set<String>? visibleShopIds;
+  final String? highlightedItemId;
 
   const _ItemsContent({
     super.key,
@@ -361,6 +528,9 @@ class _ItemsContent extends StatefulWidget {
     required this.folderId,
     required this.folderName,
     required this.role,
+    required this.visibleFolderIds,
+    required this.visibleShopIds,
+    required this.highlightedItemId,
   });
 
   @override
@@ -376,15 +546,23 @@ class _ItemsContentState extends State<_ItemsContent> {
   final ImagePicker _picker = ImagePicker();
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
+  final ScrollController _scrollController = ScrollController();
+  final GlobalKey _highlightedItemKey = GlobalKey();
 
   Timer? _searchDebounce;
+  Timer? _highlightTimer;
   StreamSubscription<User?>? _authSub;
 
   String _appliedSearchQuery = "";
   bool _isSearchSettling = false;
   bool _handledSignedOut = false;
+  bool _didAutoScrollToHighlightedItem = false;
+  bool _showItemHighlight = false;
 
   final Set<String> _prefetchedProductIds = <String>{};
+  final Set<String> _selectedFolderIds = <String>{};
+  final Set<String> _selectedProductIds = <String>{};
+  bool _selectionStarted = false;
 
   bool _foldersErrorShown = false;
   bool _itemsErrorShown = false;
@@ -392,6 +570,16 @@ class _ItemsContentState extends State<_ItemsContent> {
   //role helpers
   bool get _isAdmin => widget.role == "admin";
   bool get _isStorageManager => widget.role == "storage_manager";
+
+  bool get _canSeeAllShops =>
+      _isAdmin || _isStorageManager || widget.visibleShopIds == null;
+
+  bool _canSeeShopId(String? shopId) {
+    if (_canSeeAllShops) return true;
+    final id = (shopId ?? "").trim();
+    if (id.isEmpty) return false;
+    return widget.visibleShopIds!.contains(id);
+  }
 
   bool get _canCreateOrders =>
       widget.role == "admin" ||
@@ -414,9 +602,11 @@ class _ItemsContentState extends State<_ItemsContent> {
   @override
   void dispose() {
     _searchDebounce?.cancel();
+    _highlightTimer?.cancel();
     _authSub?.cancel();
     _searchController.dispose();
     _searchFocusNode.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
@@ -554,6 +744,357 @@ class _ItemsContentState extends State<_ItemsContent> {
     }
   }
 
+  bool get _canSeeAllFolders =>
+      _isAdmin || _isStorageManager || widget.visibleFolderIds == null;
+
+  bool _canSeeFolderId(String folderId) {
+    final id = folderId.trim();
+    if (id.isEmpty) return false;
+    return _canSeeAllFolders || widget.visibleFolderIds!.contains(id);
+  }
+
+  bool _canSeeFolderDoc(QueryDocumentSnapshot<Map<String, dynamic>> folder) {
+    return _canSeeFolderId(folder.id);
+  }
+
+  bool _canSeeProductDoc(QueryDocumentSnapshot<Map<String, dynamic>> product) {
+    final folderId = (product.data()["folderId"] ?? "").toString().trim();
+    return _canSeeFolderId(folderId);
+  }
+
+
+  bool get _isSelectionMode =>
+      _selectionStarted || _selectedFolderIds.isNotEmpty || _selectedProductIds.isNotEmpty;
+
+  int get _selectedCount =>
+      _selectedFolderIds.length + _selectedProductIds.length;
+
+  void _startSelection() {
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+    setState(() {
+      _selectionStarted = true;
+    });
+  }
+
+  void _clearSelection() {
+    if (!mounted) return;
+    setState(() {
+      _selectionStarted = false;
+      _selectedFolderIds.clear();
+      _selectedProductIds.clear();
+    });
+  }
+
+  void _toggleFolderSelection(String folderId) {
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+    setState(() {
+      if (_selectedFolderIds.contains(folderId)) {
+        _selectedFolderIds.remove(folderId);
+      } else {
+        _selectedFolderIds.add(folderId);
+      }
+    });
+  }
+
+  void _toggleProductSelection(String productId) {
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+    setState(() {
+      if (_selectedProductIds.contains(productId)) {
+        _selectedProductIds.remove(productId);
+      } else {
+        _selectedProductIds.add(productId);
+      }
+    });
+  }
+
+  Widget _selectionOverlay({required bool selected}) {
+    if (!selected) return const SizedBox.shrink();
+
+    return IgnorePointer(
+      child: AnimatedOpacity(
+        opacity: 1,
+        duration: const Duration(milliseconds: 120),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            color: Colors.black.withOpacity(0.08),
+          ),
+          alignment: Alignment.topRight,
+          padding: const EdgeInsets.all(6),
+          child: Container(
+            width: 28,
+            height: 28,
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+            ),
+            alignment: Alignment.center,
+            child: const Icon(
+              Icons.check_circle,
+              color: Colors.lightBlue,
+              size: 24,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _wrapSelectableTile({
+    required String id,
+    required bool isFolder,
+    required bool canSelect,
+    required Widget child,
+  }) {
+    final selected = isFolder
+        ? _selectedFolderIds.contains(id)
+        : _selectedProductIds.contains(id);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          child,
+          if (canSelect && selected) _selectionOverlay(selected: selected),
+        ],
+      ),
+    );
+  }
+
+  Future<Set<String>> _collectFolderAndDescendantIds(String folderId) async {
+    final ids = <String>{folderId};
+
+    final subSnap = await _tryGetQueryCacheThenServer(
+      _foldersCol().where("parentId", isEqualTo: folderId),
+    );
+
+    for (final sub in subSnap?.docs ??
+        <QueryDocumentSnapshot<Map<String, dynamic>>>[]) {
+      final childIds = await _collectFolderAndDescendantIds(sub.id);
+      ids.addAll(childIds);
+    }
+
+    return ids;
+  }
+
+  Future<void> _showMoveSelectedDialog() async {
+    if (!_isSelectionMode || !_isAdmin) return;
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+
+    String? newParent;
+    bool hasPicked = false;
+    bool ignoreFirstCallback = true;
+
+    await _showSafeDialog<void>(
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setLocal) {
+          final maxH = MediaQuery.of(dialogContext).size.height * 0.55;
+
+          return AlertDialog(
+            title: Text("Move $_selectedCount selected"),
+            content: ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: maxH, maxWidth: 520),
+              child: SingleChildScrollView(
+                child: SizedBox(
+                  width: double.maxFinite,
+                  child: FolderPicker(
+                    tenantId: widget.tenantId,
+                    placeholder: "Select folder",
+                    // Same picker style as the single move dialog.
+                    // Files/root is not a valid destination for multi-move.
+                    allowTopLevel: false,
+                    // Keep the current folder visible when it has subfolders,
+                    // but do not allow moving back into the same folder.
+                    // Selected folders are still hidden from destination options.
+                    currentFolderId: widget.folderId,
+                    excludeFolderIds: _selectedFolderIds,
+                    excludeFolderId: _selectedFolderIds.length == 1
+                        ? _selectedFolderIds.first
+                        : null,
+                    excludeParentOfFolderId: _selectedFolderIds.length == 1
+                        ? _selectedFolderIds.first
+                        : null,
+                    preselectedFolder: null,
+                    onFolderSelected: (value) {
+                      if (ignoreFirstCallback) {
+                        ignoreFirstCallback = false;
+                        return;
+                      }
+                      setLocal(() {
+                        hasPicked = value != null && value != widget.folderId;
+                        newParent = value;
+                      });
+                    },
+                  ),
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => _safeCloseDialog(dialogContext),
+                child: const Text("Cancel"),
+              ),
+              TextButton(
+                onPressed: hasPicked
+                    ? () {
+                  final pickedParent = newParent;
+                  _safeCloseDialog(dialogContext);
+
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (!mounted || _isSignedOut() || _handledSignedOut) {
+                      return;
+                    }
+                    unawaited(_moveSelectedToFolder(pickedParent));
+                  });
+                }
+                    : null,
+                child: const Text("Move"),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _moveSelectedToFolder(String? pickedParent) async {
+    if (!_isSelectionMode || !_isAdmin) return;
+
+    // Do not allow moving to the main Files/root location or back into the same current folder.
+    if (pickedParent == null || pickedParent == widget.folderId) {
+      _showErrorToast("Please choose a different destination folder.");
+      return;
+    }
+
+    // Do not allow choosing one of the selected folders as the destination.
+    if (_selectedFolderIds.contains(pickedParent)) {
+      _showErrorToast("Choose a different destination folder.");
+      return;
+    }
+
+    // Do not allow moving into Out of stock/system folders.
+    try {
+      final pickedSnap = await _tryGetDocCacheThenServer(_foldersCol().doc(pickedParent));
+      final pickedData = pickedSnap?.data() ?? <String, dynamic>{};
+      if (_isProtectedFolder(pickedData)) {
+        _showErrorToast("Out of stock folders cannot be selected as a destination.");
+        return;
+      }
+    } catch (_) {}
+
+    _showSuccessToast("Moving selected items...");
+
+    try {
+      for (final folderId in _selectedFolderIds) {
+        if (await _isProtectedFolderById(folderId)) {
+          _showErrorToast("Out of stock folders cannot be moved.");
+          return;
+        }
+
+        final blockedIds = await _collectFolderAndDescendantIds(folderId);
+        if (blockedIds.contains(pickedParent)) {
+          _showErrorToast("A folder cannot be moved inside itself or one of its subfolders.");
+          return;
+        }
+      }
+
+      final fs = FirebaseFirestore.instance;
+      final uid = FirebaseAuth.instance.currentUser?.uid ?? "";
+      String movedByName = "";
+
+      if (uid.isNotEmpty) {
+        final userSnap = await _tryGetDocCacheThenServer(fs.collection("users").doc(uid));
+        final u = userSnap?.data() ?? <String, dynamic>{};
+        movedByName = (u["name"] ?? "").toString().trim();
+      }
+
+      final batch = fs.batch();
+
+      for (final folderId in _selectedFolderIds) {
+        final folderSnap = await _tryGetDocCacheThenServer(_foldersCol().doc(folderId));
+        if (folderSnap == null || !folderSnap.exists) continue;
+
+        final data = folderSnap.data() ?? <String, dynamic>{};
+        final oldParentId = data["parentId"] as String?;
+        if (oldParentId == pickedParent) continue;
+
+        final folderName = (data["name"] ?? "").toString().trim();
+        final paths = await FolderPaths.buildMovePathsNoRoot(
+          fs: fs,
+          tenantId: widget.tenantId,
+          oldParentId: oldParentId,
+          newParentId: pickedParent,
+          entityName: folderName.isEmpty ? "(folder)" : folderName,
+        );
+
+        batch.update(_foldersCol().doc(folderId), {"parentId": pickedParent});
+        batch.set(_movementHistoryCol().doc(), {
+          "type": "folder",
+          "entityId": folderId,
+          "name": folderName,
+          "oldPathNames": paths["old"],
+          "newPathNames": paths["new"],
+          "movedAt": FieldValue.serverTimestamp(),
+          "movedBy": uid,
+          "movedByName": movedByName,
+        });
+      }
+
+      for (final productId in _selectedProductIds) {
+        final productRef = _productsCol().doc(productId);
+        final productSnap = await _tryGetDocCacheThenServer(productRef);
+        if (productSnap == null || !productSnap.exists) continue;
+
+        final data = productSnap.data() ?? <String, dynamic>{};
+        final oldFolderId = data["folderId"] as String?;
+        if (oldFolderId == pickedParent) continue;
+
+        final code = (data["code"] ?? productId).toString().trim();
+        final paths = await FolderPaths.buildMovePathsNoRoot(
+          fs: fs,
+          tenantId: widget.tenantId,
+          oldParentId: oldFolderId,
+          newParentId: pickedParent,
+          entityName: code.isEmpty ? "(item)" : code,
+        );
+
+        final updateData = <String, dynamic>{
+          "folderId": pickedParent,
+          "updatedAt": FieldValue.serverTimestamp(),
+        };
+
+        final pickedFolderSnap = await _tryGetDocCacheThenServer(_foldersCol().doc(pickedParent));
+        final pickedFolderData = pickedFolderSnap?.data() ?? <String, dynamic>{};
+        if (!_isProtectedFolder(pickedFolderData)) {
+          updateData["originalFolderId"] = pickedParent;
+        }
+
+        batch.update(productRef, updateData);
+        batch.set(_movementHistoryCol().doc(), {
+          "type": "product",
+          "entityId": productId,
+          "name": code,
+          "oldPathNames": paths["old"],
+          "newPathNames": paths["new"],
+          "movedAt": FieldValue.serverTimestamp(),
+          "movedBy": uid,
+          "movedByName": movedByName,
+        });
+      }
+
+      await _completeWriteQuickly(batch.commit());
+
+      if (!mounted || _isSignedOut() || _handledSignedOut) return;
+      _showSuccessToast("Selected items moved.");
+      _clearSelection();
+    } catch (e) {
+      if (_isAuthOrPermissionError(e)) return;
+      if (!mounted || _isSignedOut() || _handledSignedOut) return;
+      _showErrorToast("Failed to move selected items.");
+    }
+  }
+
   void _showErrorToast(String message) {
     if (!mounted || _isSignedOut() || _handledSignedOut) return;
     TopToast.error(context, message);
@@ -660,12 +1201,23 @@ class _ItemsContentState extends State<_ItemsContent> {
   Future<_OrderCreatePayload?> _promptOrderInfoWithShopLogic() async {
     if (_isSignedOut() || _handledSignedOut) return null;
 
+    if (!_canSeeAllShops && (widget.visibleShopIds?.isEmpty ?? true)) {
+      _showErrorToast("You do not have permission to create orders for any shop.");
+      return null;
+    }
+
     final shopsSnap = await _tryGetQueryCacheThenServer(
       _shopsCol().orderBy("createdAt", descending: false),
     );
 
-    final shops = shopsSnap?.docs ??
+    final allShops = shopsSnap?.docs ??
         const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+    final shops = allShops.where((d) => _canSeeShopId(d.id)).toList();
+
+    if (allShops.isNotEmpty && shops.isEmpty) {
+      _showErrorToast("You do not have permission to create orders for any shop.");
+      return null;
+    }
 
     if (shops.isEmpty) {
       final ctrl = TextEditingController();
@@ -776,67 +1328,6 @@ class _ItemsContentState extends State<_ItemsContent> {
     );
   }
 
-  //image cropping
-  Future<XFile> _autoCenterCropTo4by3(
-      XFile input, {
-        int jpegQuality = 85,
-      }) async {
-    final Uint8List bytes = await input.readAsBytes();
-
-    img.Image? decoded = img.decodeImage(bytes);
-    if (decoded == null) {
-      throw Exception("Could not read image data.");
-    }
-
-    decoded = img.bakeOrientation(decoded);
-
-    final int w = decoded.width;
-    final int h = decoded.height;
-
-    const double target = 4 / 3;
-
-    int cropW = w;
-    int cropH = h;
-
-    if (w / h > target) {
-      cropW = (h * target).round();
-      cropH = h;
-    } else {
-      cropW = w;
-      cropH = (w / target).round();
-    }
-
-    final int x = ((w - cropW) / 2).round();
-    final int y = ((h - cropH) / 2).round();
-
-    final img.Image cropped = img.copyCrop(
-      decoded,
-      x: x,
-      y: y,
-      width: cropW,
-      height: cropH,
-    );
-
-    final List<int> outJpg = img.encodeJpg(cropped, quality: jpegQuality);
-
-    if (kIsWeb) {
-      //create image from bytes in memory (web)
-      return XFile.fromData(
-        Uint8List.fromList(outJpg),
-        name: "cropped_4x3.jpg",
-        mimeType: "image/jpeg",
-      );
-    } else {
-      //create image from bytes in memory (mobile)
-      final dir = await getTemporaryDirectory();
-      final path =
-          "${dir.path}/cropped_4x3_${DateTime.now().millisecondsSinceEpoch}.jpg";
-      final file = File(path);
-      await file.writeAsBytes(outJpg, flush: true);
-      return XFile(file.path);
-    }
-  }
-
   Future<void> _pickAndOpenNewItem(ImageSource source) async {
     if (!mounted || _isSignedOut() || _handledSignedOut) return;
 
@@ -857,27 +1348,15 @@ class _ItemsContentState extends State<_ItemsContent> {
       return;
     }
 
-    try {
-      final XFile cropped = await _autoCenterCropTo4by3(
-        picked,
-        jpegQuality: 85,
-      );
-
-      if (!mounted || _isSignedOut() || _handledSignedOut) return;
-
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => NewItemScreen(
-            folderId: widget.folderId,
-            originalFolderId: widget.folderId,
-            initialImage: cropped,
-          ),
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NewItemScreen(
+          folderId: widget.folderId,
+          originalFolderId: widget.folderId,
+          initialImage: picked,
         ),
-      );
-    } catch (e) {
-      if (!mounted || _isSignedOut() || _handledSignedOut) return;
-      _showErrorToast("Image processing failed: ${_cleanErr(e)}");
-    }
+      ),
+    );
   }
 
   void _showAddMenu() {
@@ -932,12 +1411,12 @@ class _ItemsContentState extends State<_ItemsContent> {
   int? _getAvailableStockNonTx({
     required Map<String, dynamic>? productData,
     required Map<String, dynamic>? yearData,
-    required bool isTshirt,
+    required bool usesSizeStock,
     required String chosenSize,
   }) {
     if (productData == null) return null;
 
-    if (!isTshirt) {
+    if (!usesSizeStock) {
       final vNew = yearData?["currentStock"];
       if (vNew != null) return _numToInt(vNew);
       return _numToInt(productData["stockQuantity"]);
@@ -962,14 +1441,22 @@ class _ItemsContentState extends State<_ItemsContent> {
     required String productId,
     required String code,
     required int quantity,
+    required String itemType,
     required bool isTshirt,
     String? size,
   }) async {
     if (quantity <= 0 || _isSignedOut() || _handledSignedOut) return false;
     if (!_canCreateOrders || _isStorageManager) return false;
 
+    final normalizedItemType = itemType.trim().isEmpty
+        ? (isTshirt ? "tshirt" : "item")
+        : itemType.trim().toLowerCase();
+
+    final usesSizeStock =
+        normalizedItemType == "tshirt" || normalizedItemType == "shoes";
+
     final chosenSize = (size ?? "").trim();
-    if (isTshirt && chosenSize.isEmpty) {
+    if (usesSizeStock && chosenSize.isEmpty) {
       await _showPopMessage("Cannot add item", "Select a size first.");
       return false;
     }
@@ -1023,7 +1510,7 @@ class _ItemsContentState extends State<_ItemsContent> {
       }
 
       final String orderLineId =
-      isTshirt ? "${productId}__$chosenSize" : productId;
+      usesSizeStock ? "${productId}__$chosenSize" : productId;
       final orderItemRef = orderRef.collection("items").doc(orderLineId);
 
       final orderItemSnap = await _tryGetDocCacheThenServer(orderItemRef);
@@ -1037,12 +1524,12 @@ class _ItemsContentState extends State<_ItemsContent> {
       final available = _getAvailableStockNonTx(
         productData: productData,
         yearData: yearData,
-        isTshirt: isTshirt,
+        usesSizeStock: usesSizeStock,
         chosenSize: chosenSize,
       );
 
       if (available != null && newTotal > available) {
-        if (!isTshirt) {
+        if (!usesSizeStock) {
           await _showPopMessage(
             "Cannot add item",
             "Not enough stock. Available: $available, already in order: $alreadyInOrder, trying to add: $quantity.",
@@ -1089,7 +1576,8 @@ class _ItemsContentState extends State<_ItemsContent> {
           "addedAt": FieldValue.serverTimestamp(),
           "year": year,
           "isTshirt": isTshirt,
-          if (isTshirt) "size": chosenSize,
+          "itemType": normalizedItemType,
+          if (usesSizeStock) "size": chosenSize,
         },
         SetOptions(merge: true),
       );
@@ -1142,6 +1630,19 @@ class _ItemsContentState extends State<_ItemsContent> {
 
     if (futures.isNotEmpty) {
       unawaited(Future.wait(futures));
+    }
+  }
+
+  Future<void> _deleteProductStorageImage(String productId) async {
+    try {
+      await FirebaseStorage.instance
+          .ref("tenants/${widget.tenantId}/products/$productId/main.jpg")
+          .delete();
+    } on FirebaseException catch (e) {
+      // If the image is already missing, do not block item deletion.
+      if (e.code != "object-not-found") {
+        rethrow;
+      }
     }
   }
 
@@ -1359,6 +1860,8 @@ class _ItemsContentState extends State<_ItemsContent> {
 
     for (final doc in itemsSnap?.docs ??
         <QueryDocumentSnapshot<Map<String, dynamic>>>[]) {
+      await _deleteProductStorageImage(doc.id);
+
       await OfflineMediaService.instance.deleteOfflineImage(
         tenantId: widget.tenantId,
         productId: doc.id,
@@ -1642,6 +2145,8 @@ class _ItemsContentState extends State<_ItemsContent> {
               _safeCloseDialog(dialogContext);
 
               try {
+                await _deleteProductStorageImage(itemId);
+
                 await _completeWriteQuickly(
                   _productsCol().doc(itemId).delete(),
                 );
@@ -1762,6 +2267,7 @@ class _ItemsContentState extends State<_ItemsContent> {
         final allFolders = snap.data!.docs;
 
         final folders = allFolders.where((f) {
+          if (!_canSeeFolderDoc(f)) return false;
           if (_appliedSearchQuery.isEmpty) return true;
           final name = (f.data()["name"] ?? "").toString().toLowerCase();
           return name.contains(_appliedSearchQuery);
@@ -1791,29 +2297,71 @@ class _ItemsContentState extends State<_ItemsContent> {
             final canManageFolder =
                 _isAdmin && !_isProtectedFolder(folderData);
 
-            return FolderGridTile(
-              folderName: folderName,
-              breadcrumb: "",
-              isAdmin: canManageFolder,
-              onTap: () {
-                if (!mounted || _isSignedOut() || _handledSignedOut) return;
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => ItemsScreen(
-                      folderId: folderId,
-                      folderName: folderName,
+            return _wrapSelectableTile(
+              id: folderId,
+              isFolder: true,
+              canSelect: canManageFolder,
+              child: FolderGridTile(
+                folderName: folderName,
+                breadcrumb: "",
+                isAdmin: canManageFolder && !_isSelectionMode,
+                onTap: () {
+                  if (!mounted || _isSignedOut() || _handledSignedOut) return;
+                  if (_isSelectionMode && canManageFolder) {
+                    _toggleFolderSelection(folderId);
+                    return;
+                  }
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => ItemsScreen(
+                        folderId: folderId,
+                        folderName: folderName,
+                      ),
                     ),
-                  ),
-                );
-              },
-              onRename: () => _renameFolder(folderId, folderName),
-              onMove: () => _moveFolder(folderId),
-              onDelete: () => _confirmDeleteFolder(folderId, folderName),
+                  );
+                },
+                onRename: () => _renameFolder(folderId, folderName),
+                onMove: () => _moveFolder(folderId),
+                onDelete: () => _confirmDeleteFolder(folderId, folderName),
+              ),
             );
           },
         );
       },
     );
+  }
+
+  void _scheduleAutoScrollToHighlightedItem(
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> items,
+      ) {
+    final targetItemId = widget.highlightedItemId?.trim();
+    if (targetItemId == null || targetItemId.isEmpty) return;
+    if (_didAutoScrollToHighlightedItem) return;
+    if (!items.any((item) => item.id == targetItemId)) return;
+
+    _didAutoScrollToHighlightedItem = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted || _isSignedOut() || _handledSignedOut) return;
+
+      final targetContext = _highlightedItemKey.currentContext;
+      if (targetContext == null) return;
+
+      setState(() => _showItemHighlight = true);
+
+      await Scrollable.ensureVisible(
+        targetContext,
+        duration: const Duration(milliseconds: 500),
+        curve: Curves.easeInOut,
+        alignment: 0.35,
+      );
+
+      _highlightTimer?.cancel();
+      _highlightTimer = Timer(const Duration(milliseconds: 1200), () {
+        if (!mounted) return;
+        setState(() => _showItemHighlight = false);
+      });
+    });
   }
 
   //items section UI
@@ -1858,6 +2406,7 @@ class _ItemsContentState extends State<_ItemsContent> {
 
         final allItems = snap.data!.docs;
         final items = allItems.where((doc) {
+          if (!_canSeeProductDoc(doc)) return false;
           if (_appliedSearchQuery.isEmpty) return true;
           final data = doc.data();
           final code = (data["code"] ?? "").toString();
@@ -1868,6 +2417,8 @@ class _ItemsContentState extends State<_ItemsContent> {
           if (!mounted || _isSignedOut() || _handledSignedOut) return;
           unawaited(_prefetchVisibleProductImages(items: items));
         });
+
+        _scheduleAutoScrollToHighlightedItem(items);
 
         if (items.isEmpty) {
           return Padding(
@@ -1900,35 +2451,46 @@ class _ItemsContentState extends State<_ItemsContent> {
             final id = item.id;
             final data = item.data();
 
-            return _ItemCard(
-              tenantId: widget.tenantId,
-              itemId: id,
-              itemData: data,
-              allItemIds: itemIds,
-              initialIndex: index,
-              isAdmin: _isAdmin,
-              canCreateOrders: _canCreateOrders && !_isStorageManager,
-              sizes: _sizes,
-              onAdd: ({
-                required int quantity,
-                required String? size,
-              }) async {
-                return _addItemToActiveOrder(
-                  productId: id,
-                  code: (data["code"] ?? "").toString(),
-                  quantity: quantity,
-                  isTshirt: (data["isTshirt"] ?? false) == true,
-                  size: size,
-                );
-              },
-              onRename: () async => _renameItem(
-                id,
-                (data["code"] ?? "").toString(),
-              ),
-              onMove: () async => _moveItem(id),
-              onDelete: () async => _confirmDeleteItem(
-                id,
-                (data["code"] ?? "").toString(),
+            final isHighlighted =
+                id == widget.highlightedItemId && _showItemHighlight;
+
+            return KeyedSubtree(
+              key: id == widget.highlightedItemId ? _highlightedItemKey : null,
+              child: _ItemCard(
+                tenantId: widget.tenantId,
+                itemId: id,
+                itemData: data,
+                allItemIds: itemIds,
+                initialIndex: index,
+                isAdmin: _isAdmin,
+                canCreateOrders: _canCreateOrders && !_isStorageManager,
+                sizes: _sizes,
+                selectionMode: _isSelectionMode,
+                isSelected: _selectedProductIds.contains(id),
+                isHighlighted: isHighlighted,
+                onSelectionToggle: () => _toggleProductSelection(id),
+                onAdd: ({
+                  required int quantity,
+                  required String? size,
+                }) async {
+                  return _addItemToActiveOrder(
+                    productId: id,
+                    code: (data["code"] ?? "").toString(),
+                    quantity: quantity,
+                    itemType: (data["itemType"] ?? "").toString(),
+                    isTshirt: (data["isTshirt"] ?? false) == true,
+                    size: size,
+                  );
+                },
+                onRename: () async => _renameItem(
+                  id,
+                  (data["code"] ?? "").toString(),
+                ),
+                onMove: () async => _moveItem(id),
+                onDelete: () async => _confirmDeleteItem(
+                  id,
+                  (data["code"] ?? "").toString(),
+                ),
               ),
             );
           },
@@ -1941,28 +2503,105 @@ class _ItemsContentState extends State<_ItemsContent> {
   Widget build(BuildContext context) {
     final keyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
 
+    if (!_canSeeFolderId(widget.folderId)) {
+      return Scaffold(
+        appBar: AppBar(
+          backgroundColor: const Color(0xff0B1E40),
+          title: Text(
+            widget.folderName,
+            style: const TextStyle(color: Colors.white),
+          ),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back, color: Colors.white),
+            onPressed: () {
+              if (!mounted) return;
+
+              final navigator = Navigator.of(context);
+              if (navigator.canPop()) {
+                navigator.pop();
+                return;
+              }
+
+              navigator.pushReplacement(
+                MaterialPageRoute(builder: (_) => const FilesScreen()),
+              );
+            },
+          ),
+        ),
+        bottomNavigationBar: BottomNav(
+          currentIndex: 1,
+          hasFab: false,
+          isRootScreen: false,
+          filesButtonOpensMainFiles: true,
+        ),
+        body: const SafeArea(
+          child: Center(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: 24),
+              child: Text(
+                "This folder is hidden for your account.",
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 16),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       extendBody: true,
       resizeToAvoidBottomInset: true,
       appBar: AppBar(
         backgroundColor: const Color(0xff0B1E40),
         title: Text(
-          widget.folderName,
+          _isSelectionMode ? "$_selectedCount selected" : widget.folderName,
           style: const TextStyle(color: Colors.white),
         ),
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          icon: Icon(
+            _isSelectionMode ? Icons.close : Icons.arrow_back,
+            color: Colors.white,
+          ),
           onPressed: () {
             if (!mounted) return;
-            if (Navigator.of(context).canPop()) {
-              Navigator.of(context).pop();
+            if (_isSelectionMode) {
+              _clearSelection();
+              return;
             }
+
+            final navigator = Navigator.of(context);
+            if (navigator.canPop()) {
+              navigator.pop();
+              return;
+            }
+
+            navigator.pushReplacement(
+              MaterialPageRoute(builder: (_) => const FilesScreen()),
+            );
           },
         ),
+        actions: _isSelectionMode
+            ? [
+          IconButton(
+            tooltip: "Move selected",
+            icon: const Icon(Icons.drive_file_move_outline, color: Colors.white),
+            onPressed: _selectedCount > 0 ? _showMoveSelectedDialog : null,
+          ),
+        ]
+            : _isAdmin
+            ? [
+          IconButton(
+            tooltip: "Select items",
+            icon: const Icon(Icons.task_alt, color: Colors.white),
+            onPressed: _startSelection,
+          ),
+        ]
+            : null,
       ),
       floatingActionButtonLocation:
       _isAdmin ? FloatingActionButtonLocation.centerDocked : null,
-      floatingActionButton: _isAdmin && !keyboardOpen
+      floatingActionButton: _isAdmin && !keyboardOpen && !_isSelectionMode
           ? FloatingActionButton(
         heroTag: null,
         backgroundColor: const Color(0xff0B1E40),
@@ -1981,6 +2620,7 @@ class _ItemsContentState extends State<_ItemsContent> {
           currentIndex: 1,
           hasFab: _isAdmin,
           isRootScreen: false,
+          filesButtonOpensMainFiles: true,
         ),
       ),
       body: SafeArea(
@@ -1997,6 +2637,7 @@ class _ItemsContentState extends State<_ItemsContent> {
               const LinearProgressIndicator(minHeight: 2),
             Expanded(
               child: SingleChildScrollView(
+                controller: _scrollController,
                 keyboardDismissBehavior:
                 ScrollViewKeyboardDismissBehavior.manual,
                 padding: EdgeInsets.only(
@@ -2027,6 +2668,10 @@ class _ItemCard extends StatefulWidget {
   final bool isAdmin;
   final bool canCreateOrders;
   final List<String> sizes;
+  final bool selectionMode;
+  final bool isSelected;
+  final bool isHighlighted;
+  final VoidCallback onSelectionToggle;
   final Future<bool> Function({
   required int quantity,
   required String? size,
@@ -2044,6 +2689,10 @@ class _ItemCard extends StatefulWidget {
     required this.isAdmin,
     required this.canCreateOrders,
     required this.sizes,
+    required this.selectionMode,
+    required this.isSelected,
+    required this.isHighlighted,
+    required this.onSelectionToggle,
     required this.onAdd,
     required this.onRename,
     required this.onMove,
@@ -2061,7 +2710,38 @@ class _ItemCardState extends State<_ItemCard> {
   bool isSubmitting = false;
   Timer? _tickTimer;
 
-  bool get isTshirt => (widget.itemData["isTshirt"] ?? false) == true;
+  static const List<String> _adultTshirtSizes = [
+    "XXS",
+    "XS",
+    "S",
+    "M",
+    "L",
+    "XL",
+    "2XL",
+    "3XL",
+  ];
+
+  static const List<String> _kidsTshirtSizes = [
+    "1-2",
+    "3-4",
+    "5-6",
+    "7-8",
+    "9-10",
+    "11-12",
+  ];
+
+  String get itemType {
+    final raw = (widget.itemData["itemType"] ?? "").toString().trim().toLowerCase();
+    if (raw.isNotEmpty) return raw;
+
+    // Backwards compatibility for older products created before itemType existed.
+    return (widget.itemData["isTshirt"] ?? false) == true ? "tshirt" : "item";
+  }
+
+  bool get isTshirt => itemType == "tshirt";
+  bool get isShoes => itemType == "shoes";
+  bool get usesSizeStock => isTshirt || isShoes;
+
   String get code => (widget.itemData["code"] ?? "").toString();
   String get imageUrl => (widget.itemData["imageUrl"] ?? "").toString().trim();
   int get _currentYear => DateTime.now().year;
@@ -2070,7 +2750,8 @@ class _ItemCardState extends State<_ItemCard> {
   void initState() {
     super.initState();
     qty = 0;
-    selectedSize = widget.sizes.first;
+    final sizes = _availableSizeOptions();
+    selectedSize = sizes.isEmpty ? "" : sizes.first;
   }
 
   @override
@@ -2084,26 +2765,124 @@ class _ItemCardState extends State<_ItemCard> {
     return int.tryParse(v?.toString() ?? "") ?? 0;
   }
 
+  Map<String, dynamic> _mapFrom(dynamic raw) {
+    return (raw as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
+  }
+
+  List<String> _availableSizeOptions({Map<String, dynamic>? yearData}) {
+    if (isTshirt) {
+      final group = (widget.itemData["sizeGroup"] ?? "adult")
+          .toString()
+          .trim()
+          .toLowerCase();
+      return group == "kids" ? _kidsTshirtSizes : _adultTshirtSizes;
+    }
+
+    if (isShoes) {
+      final currentSizeStock = _mapFrom(yearData?["currentSizeStock"]);
+      final savedSizeStock = _mapFrom(widget.itemData["sizeStock"]);
+
+      final keys = <String>{
+        ...savedSizeStock.keys.map((e) => e.toString().trim()),
+        ...currentSizeStock.keys.map((e) => e.toString().trim()),
+      }.where((e) => e.isNotEmpty).toList();
+
+      keys.sort(_compareSizeLabels);
+      return keys;
+    }
+
+    return const <String>[];
+  }
+
+  int _compareSizeLabels(String a, String b) {
+    final na = double.tryParse(a.replaceAll(",", "."));
+    final nb = double.tryParse(b.replaceAll(",", "."));
+
+    if (na != null && nb != null) {
+      return na.compareTo(nb);
+    }
+
+    if (na != null) return -1;
+    if (nb != null) return 1;
+
+    return a.toLowerCase().compareTo(b.toLowerCase());
+  }
+
+  List<String> _dedupeSizeOptions(List<String> rawOptions) {
+    final seen = <String>{};
+    final cleaned = <String>[];
+
+    for (final raw in rawOptions) {
+      final value = raw.toString().trim();
+      if (value.isEmpty) continue;
+
+      // Use lower-case only for duplicate detection so "XXS" and "xxs"
+      // cannot appear as two dropdown options with the same meaning.
+      final key = value.toLowerCase();
+      if (seen.add(key)) {
+        cleaned.add(value);
+      }
+    }
+
+    return cleaned;
+  }
+
+  String? _safeDropdownValue(List<String> sizeOptions) {
+    if (!usesSizeStock || selectedSize.trim().isEmpty) return null;
+
+    // Flutter DropdownButton requires the selected value to match exactly one item.
+    // This protects the screen if old data accidentally contains duplicate sizes,
+    // different casing, or spaces around size labels.
+    final exactMatches = sizeOptions.where((s) => s == selectedSize).length;
+    if (exactMatches == 1) return selectedSize;
+
+    final selectedKey = selectedSize.trim().toLowerCase();
+    final caseMatches = sizeOptions
+        .where((s) => s.trim().toLowerCase() == selectedKey)
+        .toList();
+
+    if (caseMatches.length == 1) return caseMatches.first;
+    return null;
+  }
+
+  void _ensureSelectedSizeIsValid(List<String> sizeOptions) {
+    if (!usesSizeStock) return;
+
+    if (sizeOptions.isEmpty) {
+      if (selectedSize.isEmpty) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        setState(() => selectedSize = "");
+      });
+      return;
+    }
+
+    final safeValue = _safeDropdownValue(sizeOptions);
+    if (safeValue != null && safeValue == selectedSize) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() => selectedSize = safeValue ?? sizeOptions.first);
+    });
+  }
+
   int _getAvailableStock({
     required Map<String, dynamic> productData,
     required Map<String, dynamic>? yearData,
-    required bool isTshirt,
     required String selectedSize,
   }) {
-    if (!isTshirt) {
+    if (!usesSizeStock) {
+      final vNew = yearData?["currentStock"];
+      if (vNew != null) return _numToInt(vNew);
       return _numToInt(productData["stockQuantity"]);
     }
 
-    final Map<String, dynamic> currentSizeStock =
-        (yearData?["currentSizeStock"] as Map?)?.cast<String, dynamic>() ?? {};
-
+    final currentSizeStock = _mapFrom(yearData?["currentSizeStock"]);
     if (currentSizeStock.containsKey(selectedSize)) {
       return _numToInt(currentSizeStock[selectedSize]);
     }
 
-    final Map<String, dynamic> oldSizeStock =
-        (productData["sizeStock"] as Map?)?.cast<String, dynamic>() ?? {};
-
+    final oldSizeStock = _mapFrom(productData["sizeStock"]);
     if (oldSizeStock.containsKey(selectedSize)) {
       return _numToInt(oldSizeStock[selectedSize]);
     }
@@ -2125,13 +2904,14 @@ class _ItemCardState extends State<_ItemCard> {
 
   Future<void> _handleAdd() async {
     if (qty <= 0 || isSubmitting || !widget.canCreateOrders) return;
+    if (usesSizeStock && selectedSize.trim().isEmpty) return;
 
     setState(() => isSubmitting = true);
 
     try {
       final added = await widget.onAdd(
         quantity: qty,
-        size: isTshirt ? selectedSize : null,
+        size: usesSizeStock ? selectedSize : null,
       );
 
       if (!mounted) return;
@@ -2149,7 +2929,13 @@ class _ItemCardState extends State<_ItemCard> {
     }
   }
 
-  Widget _buildQtyControls(int maxQty) {
+  Widget _buildQtyControls({
+    required int maxQty,
+    required List<String> sizeOptions,
+  }) {
+    final cleanSizeOptions = _dedupeSizeOptions(sizeOptions);
+    final dropdownValue = _safeDropdownValue(cleanSizeOptions);
+
     final bool canIncrease = qty < maxQty;
     final bool canDecrease = qty > 0;
 
@@ -2188,7 +2974,7 @@ class _ItemCardState extends State<_ItemCard> {
               }
                   : null,
             ),
-            if (isTshirt) ...[
+            if (usesSizeStock && cleanSizeOptions.isNotEmpty) ...[
               const SizedBox(width: 6),
               Padding(
                 padding: const EdgeInsets.only(top: 9),
@@ -2196,7 +2982,10 @@ class _ItemCardState extends State<_ItemCard> {
                   width: 68,
                   height: 32,
                   child: DropdownButtonFormField<String>(
-                    value: selectedSize,
+                    key: ValueKey<String>(
+                      '${widget.itemId}-${itemType}-${cleanSizeOptions.join('|')}-$dropdownValue',
+                    ),
+                    value: dropdownValue,
                     isDense: true,
                     isExpanded: true,
                     alignment: Alignment.center,
@@ -2205,7 +2994,7 @@ class _ItemCardState extends State<_ItemCard> {
                       contentPadding: EdgeInsets.symmetric(horizontal: 6),
                       border: OutlineInputBorder(),
                     ),
-                    items: widget.sizes
+                    items: cleanSizeOptions
                         .map(
                           (s) => DropdownMenuItem<String>(
                         value: s,
@@ -2291,6 +3080,10 @@ class _ItemCardState extends State<_ItemCard> {
               Expanded(
                 child: GestureDetector(
                   onTap: () {
+                    if (widget.selectionMode && widget.isAdmin) {
+                      widget.onSelectionToggle();
+                      return;
+                    }
                     Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => ItemDetailsPagerScreen(
@@ -2300,37 +3093,34 @@ class _ItemCardState extends State<_ItemCard> {
                       ),
                     );
                   },
-                  child: Container(
-                    width: double.infinity,
-                    decoration: const BoxDecoration(
-                      borderRadius: BorderRadius.vertical(
-                        top: Radius.circular(12),
-                      ),
+                  child: ClipRRect(
+                    borderRadius: const BorderRadius.vertical(
+                      top: Radius.circular(12),
                     ),
-                    child: OfflineImageWidget(
-                      tenantId: widget.tenantId,
-                      productId: widget.itemId,
-                      imageUrl: imageUrl.isEmpty ? null : imageUrl,
-                      fit: BoxFit.cover,
-                      borderRadius: const BorderRadius.vertical(
-                        top: Radius.circular(12),
-                      ),
-                      placeholder: Container(
-                        color: Colors.grey.shade100,
-                        alignment: Alignment.center,
-                        child: const SizedBox(
-                          width: 22,
-                          height: 22,
-                          child: CircularProgressIndicator(strokeWidth: 2),
+                    child: AspectRatio(
+                      aspectRatio: 4 / 3,
+                      child: OfflineImageWidget(
+                        tenantId: widget.tenantId,
+                        productId: widget.itemId,
+                        imageUrl: imageUrl.isEmpty ? null : imageUrl,
+                        fit: BoxFit.cover,
+                        placeholder: Container(
+                          color: Colors.grey.shade100,
+                          alignment: Alignment.center,
+                          child: const SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
                         ),
-                      ),
-                      errorWidget: Container(
-                        color: Colors.grey.shade100,
-                        alignment: Alignment.center,
-                        child: const Icon(
-                          Icons.image_outlined,
-                          size: 56,
-                          color: Colors.grey,
+                        errorWidget: Container(
+                          color: Colors.grey.shade100,
+                          alignment: Alignment.center,
+                          child: const Icon(
+                            Icons.image_outlined,
+                            size: 56,
+                            color: Colors.grey,
+                          ),
                         ),
                       ),
                     ),
@@ -2377,14 +3167,21 @@ class _ItemCardState extends State<_ItemCard> {
                     final yearData =
                         snap.data?.data() ?? <String, dynamic>{};
 
+                    final sizeOptions = _dedupeSizeOptions(
+                      _availableSizeOptions(yearData: yearData),
+                    );
+                    _ensureSelectedSizeIsValid(sizeOptions);
+
                     final maxQty = _getAvailableStock(
                       productData: widget.itemData,
                       yearData: yearData,
-                      isTshirt: isTshirt,
                       selectedSize: selectedSize,
                     );
 
-                    return _buildQtyControls(maxQty < 0 ? 0 : maxQty);
+                    return _buildQtyControls(
+                      maxQty: maxQty < 0 ? 0 : maxQty,
+                      sizeOptions: sizeOptions,
+                    );
                   },
                 )
               else
@@ -2392,7 +3189,62 @@ class _ItemCardState extends State<_ItemCard> {
             ],
           ),
         ),
-        if (widget.isAdmin)
+        if (widget.isHighlighted)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: AnimatedOpacity(
+                opacity: widget.isHighlighted ? 1 : 0,
+                duration: const Duration(milliseconds: 180),
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    color: const Color(0xff367eff).withOpacity(0.05),
+                    border: Border.all(
+                      color: const Color(0xff072b6c),
+                      width: 2,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        if (widget.isAdmin && widget.isSelected)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: AnimatedOpacity(
+                opacity: 1,
+                duration: const Duration(milliseconds: 120),
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    color: Colors.black.withOpacity(0.08),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        if (widget.isAdmin && widget.isSelected)
+          Positioned(
+            top: 6,
+            right: 6,
+            child: IgnorePointer(
+              child: Container(
+                width: 28,
+                height: 28,
+                decoration: const BoxDecoration(
+                  color: Colors.white,
+                  shape: BoxShape.circle,
+                ),
+                alignment: Alignment.center,
+                child: const Icon(
+                  Icons.check_circle,
+                  color: Colors.lightBlue,
+                  size: 24,
+                ),
+              ),
+            ),
+          ),
+        if (widget.isAdmin && !widget.selectionMode)
           Positioned(
             right: -6,
             top: -6,

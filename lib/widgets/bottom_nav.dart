@@ -6,22 +6,32 @@ import 'package:flutter/material.dart';
 
 import '../screens/files_screen.dart';
 import '../screens/home_screen.dart';
+import '../screens/items_screen.dart';
 import '../screens/order_details_screen.dart';
 import '../screens/orders_screen.dart';
 import '../screens/profile_screen.dart';
+import '../services/last_items_screen_service.dart';
 import '../services/tenant_context_service.dart';
 
 class BottomNav extends StatelessWidget {
   final int currentIndex;
   final bool hasFab;
-
   final bool isRootScreen;
+
+  /// Set this to true only from ItemsScreen.
+  ///
+  /// Behaviour:
+  /// - true  = tapping Files opens the main FilesScreen.
+  /// - false = tapping Files opens the last remembered ItemsScreen folder,
+  ///           if one exists; otherwise it opens FilesScreen.
+  final bool filesButtonOpensMainFiles;
 
   const BottomNav({
     super.key,
     required this.currentIndex,
     this.hasFab = true,
     this.isRootScreen = true,
+    this.filesButtonOpensMainFiles = false,
   });
 
   TenantContextService get _tenantContext => TenantContextService();
@@ -60,28 +70,13 @@ class BottomNav extends StatelessWidget {
     }
   }
 
-  Route _smoothRoute(Widget page) {
+  Route _dropboxStyleRoute(Widget page) {
     return PageRouteBuilder(
-      transitionDuration: const Duration(milliseconds: 240),
-      reverseTransitionDuration: const Duration(milliseconds: 200),
+      transitionDuration: Duration.zero,
+      reverseTransitionDuration: Duration.zero,
       pageBuilder: (context, animation, secondaryAnimation) => page,
       transitionsBuilder: (context, animation, secondaryAnimation, child) {
-        final curved = CurvedAnimation(
-          parent: animation,
-          curve: Curves.easeOutCubic,
-          reverseCurve: Curves.easeInCubic,
-        );
-
-        final fade = Tween<double>(begin: 0.0, end: 1.0).animate(curved);
-        final slide = Tween<Offset>(
-          begin: const Offset(0.04, 0.0),
-          end: Offset.zero,
-        ).animate(curved);
-
-        return FadeTransition(
-          opacity: fade,
-          child: SlideTransition(position: slide, child: child),
-        );
+        return child;
       },
     );
   }
@@ -90,10 +85,10 @@ class BottomNav extends StatelessWidget {
     FocusManager.instance.primaryFocus?.unfocus();
   }
 
-  void _pushReplacementSmooth(BuildContext context, Widget page) {
+  void _pushReplacementDropboxStyle(BuildContext context, Widget page) {
     if (!context.mounted) return;
     _unfocusSafely();
-    Navigator.of(context).pushReplacement(_smoothRoute(page));
+    Navigator.of(context).pushReplacement(_dropboxStyleRoute(page));
   }
 
   Future<QuerySnapshot<Map<String, dynamic>>?> _tryGetQueryQuickly(
@@ -138,7 +133,10 @@ class BottomNav extends StatelessWidget {
 
       if (activeSnap != null && activeSnap.docs.isNotEmpty) {
         final activeOrderId = activeSnap.docs.first.id;
-        return OrderDetailsScreen(orderId: activeOrderId);
+        return OrderDetailsScreen(
+          orderId: activeOrderId,
+          goToOrdersOnBack: true,
+        );
       }
 
       return const OrdersScreen();
@@ -151,6 +149,21 @@ class BottomNav extends StatelessWidget {
 
       return const OrdersScreen();
     }
+  }
+
+  Widget _resolveFilesTarget() {
+    if (filesButtonOpensMainFiles) {
+      return const FilesScreen();
+    }
+
+    if (LastItemsScreenService.hasFolder) {
+      return ItemsScreen(
+        folderId: LastItemsScreenService.folderId!,
+        folderName: LastItemsScreenService.folderName!,
+      );
+    }
+
+    return const FilesScreen();
   }
 
   Future<void> _navigate(BuildContext context, int index) async {
@@ -166,13 +179,13 @@ class BottomNav extends StatelessWidget {
     if (_isSignedOut()) {
       switch (index) {
         case 1:
-          _pushReplacementSmooth(context, const FilesScreen());
+          _pushReplacementDropboxStyle(context, const FilesScreen());
           return;
         case 2:
-          _pushReplacementSmooth(context, const OrdersScreen());
+          _pushReplacementDropboxStyle(context, const OrdersScreen());
           return;
         case 3:
-          _pushReplacementSmooth(context, const ProfileScreen());
+          _pushReplacementDropboxStyle(context, const ProfileScreen());
           return;
         case 0:
           return;
@@ -187,18 +200,18 @@ class BottomNav extends StatelessWidget {
 
     switch (index) {
       case 0:
-        _pushReplacementSmooth(context, const HomeScreen());
+        _pushReplacementDropboxStyle(context, const HomeScreen());
         break;
       case 1:
-        _pushReplacementSmooth(context, const FilesScreen());
+        _pushReplacementDropboxStyle(context, _resolveFilesTarget());
         break;
       case 2:
         final target = await _resolveOrdersTarget();
         if (!context.mounted) return;
-        _pushReplacementSmooth(context, target);
+        _pushReplacementDropboxStyle(context, target);
         break;
       case 3:
-        _pushReplacementSmooth(context, const ProfileScreen());
+        _pushReplacementDropboxStyle(context, const ProfileScreen());
         break;
     }
   }

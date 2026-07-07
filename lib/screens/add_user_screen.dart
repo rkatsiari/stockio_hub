@@ -1,6 +1,7 @@
 // create a user through cloud function
 import 'dart:async';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -47,6 +48,8 @@ class _AddUserScreenState extends State<AddUserScreen> {
   bool _obscurePassword = true; //show password
   bool _obscureConfirmPassword = true; //show password
   bool _handledSignedOut = false; // to avoid lifecycle errors
+  bool _shopIdsInitialised = false;
+  final Set<String> _selectedShopIds = <String>{};
 
   //listen in case user logout
   @override
@@ -140,6 +143,181 @@ class _AddUserScreenState extends State<AddUserScreen> {
   void _showSuccessToast(String message) {
     if (!_canUseContext()) return;
     TopToast.success(context, message);
+  }
+
+  bool _roleUsesShopPermissions(String value) {
+    final cleanRole = value.trim().toLowerCase();
+    return cleanRole != "admin" && cleanRole != "storage_manager";
+  }
+
+
+
+  CollectionReference<Map<String, dynamic>> _shopsRef() {
+    return FirebaseFirestore.instance
+        .collection("tenants")
+        .doc(widget.tenantId)
+        .collection("shops");
+  }
+
+  DocumentReference<Map<String, dynamic>> _tenantUserRef(String uid) {
+    return FirebaseFirestore.instance
+        .collection("tenants")
+        .doc(widget.tenantId)
+        .collection("users")
+        .doc(uid);
+  }
+
+  DocumentReference<Map<String, dynamic>> _rootUserRef(String uid) {
+    return FirebaseFirestore.instance.collection("users").doc(uid);
+  }
+
+  Future<void> _saveVisibleShopIdsForUser(String uid) async {
+    final ids = _selectedShopIds.toList()..sort();
+    final batch = FirebaseFirestore.instance.batch();
+    final data = <String, dynamic>{
+      "visibleShopIds": ids,
+      "shopAccessUpdatedAt": FieldValue.serverTimestamp(),
+    };
+
+    batch.set(_tenantUserRef(uid), data, SetOptions(merge: true));
+    batch.set(_rootUserRef(uid), data, SetOptions(merge: true));
+    await batch.commit();
+  }
+
+  Widget _buildShopAccessSelector() {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: _shopsRef().orderBy("createdAt", descending: false).snapshots(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return const Text("Could not load shops.");
+        }
+
+        if (!snapshot.hasData) {
+          return const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Center(child: CircularProgressIndicator()),
+          );
+        }
+
+        final shops = snapshot.data!.docs;
+
+        if (!_shopIdsInitialised && shops.isNotEmpty) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted || _shopIdsInitialised) return;
+            setState(() {
+              _selectedShopIds
+                ..clear()
+                ..addAll(shops.map((d) => d.id));
+              _shopIdsInitialised = true;
+            });
+          });
+        }
+
+        if (shops.isEmpty) {
+          return Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              "No shops have been created yet. This user will not be able to create shop orders until shops are added.",
+              style: TextStyle(
+                color: Colors.grey.shade700,
+                fontSize: 13,
+                height: 1.35,
+              ),
+            ),
+          );
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    "Shop permissions",
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 18,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: isLoading
+                      ? null
+                      : () {
+                    setState(() {
+                      _selectedShopIds
+                        ..clear()
+                        ..addAll(shops.map((d) => d.id));
+                      _shopIdsInitialised = true;
+                    });
+                  },
+                  child: const Text(
+                    "All",
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                TextButton(
+                  onPressed: isLoading
+                      ? null
+                      : () {
+                    setState(() {
+                      _selectedShopIds.clear();
+                      _shopIdsInitialised = true;
+                    });
+                  },
+                  child: const Text(
+                    "None",
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _selectedShopIds.isEmpty
+                  ? "No shops selected. This user cannot create orders."
+                  : "Selected ${_selectedShopIds.length} of ${shops.length} shops.",
+              style: TextStyle(
+                color: _selectedShopIds.isEmpty
+                    ? Colors.red.shade700
+                    : Colors.grey.shade700,
+                fontSize: 13,
+              ),
+            ),
+            const SizedBox(height: 12),
+            ...shops.map((shop) {
+              final data = shop.data();
+              final name = (data["name"] ?? "Untitled").toString();
+              final selected = _selectedShopIds.contains(shop.id);
+
+              return CheckboxListTile(
+                value: selected,
+                enabled: !isLoading,
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                visualDensity: const VisualDensity(horizontal: 0, vertical: -2),
+                title: Text(name),
+                secondary: const Icon(Icons.store_outlined),
+                controlAffinity: ListTileControlAffinity.trailing,
+                onChanged: isLoading
+                    ? null
+                    : (value) {
+                  setState(() {
+                    _shopIdsInitialised = true;
+                    if (value == true) {
+                      _selectedShopIds.add(shop.id);
+                    } else {
+                      _selectedShopIds.remove(shop.id);
+                    }
+                  });
+                },
+              );
+            }),
+          ],
+        );
+      },
+    );
   }
 
   //error handling for cloud function
@@ -243,13 +421,21 @@ class _AddUserScreenState extends State<AddUserScreen> {
       final functions = FirebaseFunctions.instanceFor(region: 'us-central1');
       final callable = functions.httpsCallable('createAuthUser');
 
-      await callable.call({
+      final result = await callable.call({
         "tenantId": widget.tenantId,
         "name": name,
         "email": email,
         "password": password,
         "role": role,
       });
+
+      final createdUid = (result.data is Map)
+          ? (result.data["uid"] ?? "").toString().trim()
+          : "";
+
+      if (createdUid.isNotEmpty && _roleUsesShopPermissions(role)) {
+        await _saveVisibleShopIdsForUser(createdUid);
+      }
 
       if (!_canUseContext()) return;
 
@@ -404,6 +590,10 @@ class _AddUserScreenState extends State<AddUserScreen> {
                 }
               },
             ),
+            if (_roleUsesShopPermissions(role)) ...[
+              const SizedBox(height: 20),
+              _buildShopAccessSelector(),
+            ],
             //create button
             const SizedBox(height: 20),
             SizedBox(

@@ -1,14 +1,10 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
-import 'package:path_provider/path_provider.dart';
 
 import '../services/offline_media_service.dart';
 import '../services/reconnect_sync_service.dart';
@@ -23,6 +19,63 @@ import '../widgets/top_toast.dart';
 import 'items_screen.dart';
 import 'new_folder_screen.dart';
 import 'new_item_screen.dart';
+
+Set<String>? _parseVisibleFolderIdsFromData(Map<String, dynamic> data) {
+  if (!data.containsKey("visibleFolderIds")) return null;
+
+  final raw = data["visibleFolderIds"];
+  if (raw == null) return null;
+
+  if (raw is Iterable) {
+    return raw
+        .map((e) => e.toString().trim())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+  }
+
+  return null;
+}
+
+Future<Set<String>?> _loadVisibleFolderIdsForCurrentUser({
+  required String tenantId,
+  required String uid,
+  required Map<String, dynamic> profile,
+}) async {
+  if (profile.containsKey("visibleFolderIds")) {
+    return _parseVisibleFolderIdsFromData(profile);
+  }
+
+  final fs = FirebaseFirestore.instance;
+  final refs = <DocumentReference<Map<String, dynamic>>>[
+    fs.collection("tenants").doc(tenantId).collection("users").doc(uid),
+    fs.collection("users").doc(uid),
+  ];
+
+  for (final ref in refs) {
+    try {
+      final cached = await ref
+          .get(const GetOptions(source: Source.cache))
+          .timeout(const Duration(milliseconds: 500));
+      final data = cached.data();
+      if (cached.exists && data != null && data.containsKey("visibleFolderIds")) {
+        return _parseVisibleFolderIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  for (final ref in refs) {
+    try {
+      final server = await ref.get().timeout(const Duration(milliseconds: 1500));
+      final data = server.data();
+      if (server.exists && data != null && data.containsKey("visibleFolderIds")) {
+        return _parseVisibleFolderIdsFromData(data);
+      }
+    } catch (_) {}
+  }
+
+  // Missing/null visibleFolderIds means all folders are visible by default.
+  return null;
+}
 
 class FilesScreen extends StatefulWidget {
   const FilesScreen({super.key});
@@ -107,9 +160,21 @@ class _FilesScreenState extends State<FilesScreen> {
         return const _FilesBootstrapState.missingTenant();
       }
 
+      final isAdmin = role == "admin";
+      final isStorageManager = role == "storage_manager";
+      final visibleFolderIds = (isAdmin || isStorageManager)
+          ? null
+          : await _loadVisibleFolderIdsForCurrentUser(
+        tenantId: tenantId,
+        uid: user.uid,
+        profile: profile,
+      );
+
       return _FilesBootstrapState.ready(
         tenantId: tenantId,
-        isAdmin: role == "admin",
+        isAdmin: isAdmin,
+        isStorageManager: isStorageManager,
+        visibleFolderIds: visibleFolderIds,
       );
     } catch (e) {
       if (_isAuthOrPermissionError(e)) {
@@ -275,9 +340,13 @@ class _FilesScreenState extends State<FilesScreen> {
         }
 
         return _FilesContent(
-          key: ValueKey<String>('files-${state.tenantId}-${state.isAdmin}'),
+          key: ValueKey<String>(
+            'files-${state.tenantId}-${state.isAdmin}-${state.isStorageManager}-${state.visibleFolderIds?.length ?? -1}',
+          ),
           tenantId: state.tenantId!,
           isAdmin: state.isAdmin,
+          isStorageManager: state.isStorageManager,
+          visibleFolderIds: state.visibleFolderIds,
         );
       },
     );
@@ -287,6 +356,8 @@ class _FilesScreenState extends State<FilesScreen> {
 class _FilesBootstrapState {
   final String? tenantId;
   final bool isAdmin;
+  final bool isStorageManager;
+  final Set<String>? visibleFolderIds;
   final bool isSignedOut;
   final bool isMissingTenant;
   final String? message;
@@ -295,6 +366,8 @@ class _FilesBootstrapState {
   const _FilesBootstrapState._({
     required this.tenantId,
     required this.isAdmin,
+    required this.isStorageManager,
+    required this.visibleFolderIds,
     required this.isSignedOut,
     required this.isMissingTenant,
     required this.message,
@@ -304,9 +377,13 @@ class _FilesBootstrapState {
   const _FilesBootstrapState.ready({
     required String tenantId,
     required bool isAdmin,
+    required bool isStorageManager,
+    required Set<String>? visibleFolderIds,
   }) : this._(
     tenantId: tenantId,
     isAdmin: isAdmin,
+    isStorageManager: isStorageManager,
+    visibleFolderIds: visibleFolderIds,
     isSignedOut: false,
     isMissingTenant: false,
     message: null,
@@ -317,6 +394,8 @@ class _FilesBootstrapState {
       : this._(
     tenantId: null,
     isAdmin: false,
+    isStorageManager: false,
+    visibleFolderIds: null,
     isSignedOut: true,
     isMissingTenant: false,
     message: null,
@@ -327,6 +406,8 @@ class _FilesBootstrapState {
       : this._(
     tenantId: null,
     isAdmin: false,
+    isStorageManager: false,
+    visibleFolderIds: null,
     isSignedOut: false,
     isMissingTenant: true,
     message: null,
@@ -338,6 +419,8 @@ class _FilesBootstrapState {
   }) : this._(
     tenantId: null,
     isAdmin: false,
+    isStorageManager: false,
+    visibleFolderIds: null,
     isSignedOut: false,
     isMissingTenant: false,
     message: message,
@@ -349,11 +432,15 @@ class _FilesBootstrapState {
 class _FilesContent extends StatefulWidget {
   final String tenantId;
   final bool isAdmin;
+  final bool isStorageManager;
+  final Set<String>? visibleFolderIds;
 
   const _FilesContent({
     super.key,
     required this.tenantId,
     required this.isAdmin,
+    required this.isStorageManager,
+    required this.visibleFolderIds,
   });
 
   @override
@@ -381,6 +468,9 @@ class _FilesContentState extends State<_FilesContent> {
   bool _searchItemsErrorShown = false;
 
   final Set<String> _prefetchedProductIds = <String>{}; //store products whose offline image has been prefetch
+  final Set<String> _selectedFolderIds = <String>{};
+  final Set<String> _selectedProductIds = <String>{};
+  bool _selectionStarted = false;
   final Map<String, String> _folderBreadcrumbCache = <String, String>{};
   final Set<String> _folderBreadcrumbsLoading = <String>{};
   final Set<String> _deletingFolderIds = <String>{}; //track folders who have been deleted so they can be removed from UI
@@ -549,6 +639,349 @@ class _FilesContentState extends State<_FilesContent> {
     }
   }
 
+  bool get _canSeeAllFolders =>
+      widget.isAdmin || widget.isStorageManager || widget.visibleFolderIds == null;
+
+  bool _canSeeFolderId(String folderId) {
+    final id = folderId.trim();
+    if (id.isEmpty) return false;
+    return _canSeeAllFolders || widget.visibleFolderIds!.contains(id);
+  }
+
+  bool _canSeeFolderDoc(QueryDocumentSnapshot<Map<String, dynamic>> folder) {
+    return _canSeeFolderId(folder.id);
+  }
+
+  bool _canSeeProductDoc(QueryDocumentSnapshot<Map<String, dynamic>> product) {
+    final folderId = (product.data()["folderId"] ?? "").toString().trim();
+    return _canSeeFolderId(folderId);
+  }
+
+
+  bool get _isSelectionMode =>
+      _selectionStarted || _selectedFolderIds.isNotEmpty || _selectedProductIds.isNotEmpty;
+
+  int get _selectedCount =>
+      _selectedFolderIds.length + _selectedProductIds.length;
+
+  void _startSelection() {
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+    setState(() {
+      _selectionStarted = true;
+    });
+  }
+
+  void _clearSelection() {
+    if (!mounted) return;
+    setState(() {
+      _selectionStarted = false;
+      _selectedFolderIds.clear();
+      _selectedProductIds.clear();
+    });
+  }
+
+  void _toggleFolderSelection(String folderId) {
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+    setState(() {
+      if (_selectedFolderIds.contains(folderId)) {
+        _selectedFolderIds.remove(folderId);
+      } else {
+        _selectedFolderIds.add(folderId);
+      }
+    });
+  }
+
+  void _toggleProductSelection(String productId) {
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+    setState(() {
+      if (_selectedProductIds.contains(productId)) {
+        _selectedProductIds.remove(productId);
+      } else {
+        _selectedProductIds.add(productId);
+      }
+    });
+  }
+
+  Widget _selectionOverlay({required bool selected}) {
+    if (!selected) return const SizedBox.shrink();
+
+    return IgnorePointer(
+      child: AnimatedOpacity(
+        opacity: 1,
+        duration: const Duration(milliseconds: 120),
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            color: Colors.black.withOpacity(0.08),
+          ),
+          alignment: Alignment.topRight,
+          padding: const EdgeInsets.all(6),
+          child: Container(
+            width: 28,
+            height: 28,
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+            ),
+            alignment: Alignment.center,
+            child: const Icon(
+              Icons.check_circle,
+              color: Colors.lightBlue,
+              size: 24,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _wrapSelectableTile({
+    required String id,
+    required bool isFolder,
+    required bool canSelect,
+    required Widget child,
+  }) {
+    final selected = isFolder
+        ? _selectedFolderIds.contains(id)
+        : _selectedProductIds.contains(id);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          child,
+          if (canSelect && selected) _selectionOverlay(selected: selected),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showMoveSelectedDialog() async {
+    if (!_isSelectionMode || !widget.isAdmin) return;
+    if (!mounted || _isSignedOut() || _handledSignedOut) return;
+
+    String? newParent;
+    bool hasPicked = false;
+    bool ignoreFirstCallback = true;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        final dialogNavigator = Navigator.of(dialogContext);
+
+        return StatefulBuilder(
+          builder: (dialogContext, setLocal) {
+            final maxH = MediaQuery.of(dialogContext).size.height * 0.55;
+
+            return AlertDialog(
+              title: Text("Move $_selectedCount selected"),
+              content: ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: maxH, maxWidth: 520),
+                child: SingleChildScrollView(
+                  child: SizedBox(
+                    width: double.maxFinite,
+                    child: FolderPicker(
+                      tenantId: widget.tenantId,
+                      placeholder: "Select folder",
+                      // Same picker style as the single move dialog.
+                      // Files/root is not a valid destination for multi-move.
+                      allowTopLevel: false,
+                      // When only one folder is selected, hide it like single move does.
+                      // Multiple selected folders are still blocked in _moveSelectedToFolder.
+                      excludeFolderIds: _selectedFolderIds,
+                      excludeFolderId: _selectedFolderIds.length == 1
+                          ? _selectedFolderIds.first
+                          : null,
+                      excludeParentOfFolderId: _selectedFolderIds.length == 1
+                          ? _selectedFolderIds.first
+                          : null,
+                      currentFolderId: _selectedFolderIds.length == 1
+                          ? _selectedFolderIds.first
+                          : null,
+                      preselectedFolder: null,
+                      onFolderSelected: (value) {
+                        if (ignoreFirstCallback) {
+                          ignoreFirstCallback = false;
+                          return;
+                        }
+                        setLocal(() {
+                          hasPicked = value != null;
+                          newParent = value;
+                        });
+                      },
+                    ),
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => _safeCloseDialogAfterUnfocus(dialogNavigator),
+                  child: const Text("Cancel"),
+                ),
+                TextButton(
+                  onPressed: hasPicked
+                      ? () {
+                    final pickedParent = newParent;
+                    _safeCloseDialogAfterUnfocus(dialogNavigator);
+
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (!mounted || _isSignedOut() || _handledSignedOut) {
+                        return;
+                      }
+                      unawaited(_moveSelectedToFolder(pickedParent));
+                    });
+                  }
+                      : null,
+                  child: const Text("Move"),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _moveSelectedToFolder(String? pickedParent) async {
+    if (!_isSelectionMode || !widget.isAdmin) return;
+
+    // The main Files/root location is not a valid destination for multi-move from FilesScreen.
+    if (pickedParent == null) {
+      _showErrorToast("Please choose a destination folder.");
+      return;
+    }
+
+    // Do not allow choosing one of the selected folders as the destination.
+    if (_selectedFolderIds.contains(pickedParent)) {
+      _showErrorToast("Choose a different destination folder.");
+      return;
+    }
+
+    // Do not allow moving into Out of stock/system folders.
+    try {
+      final pickedSnap = await _getDocCacheThenServer(_foldersRef().doc(pickedParent));
+      final pickedData = pickedSnap.data() ?? <String, dynamic>{};
+      if (_isProtectedFolder(pickedData)) {
+        _showErrorToast("Out of stock folders cannot be selected as a destination.");
+        return;
+      }
+    } catch (_) {}
+
+    _showSuccessToast("Moving selected items...");
+
+    try {
+      for (final folderId in _selectedFolderIds) {
+        if (await _isProtectedFolderById(folderId)) {
+          _showErrorToast("Out of stock folders cannot be moved.");
+          return;
+        }
+
+        final blockedIds = await _collectFolderAndDescendantIds(folderId);
+        if (blockedIds.contains(pickedParent)) {
+          _showErrorToast("A folder cannot be moved inside itself or one of its subfolders.");
+          return;
+        }
+      }
+
+      final fs = FirebaseFirestore.instance;
+      final uid = FirebaseAuth.instance.currentUser?.uid ?? "";
+      String movedByName = "";
+
+      if (uid.isNotEmpty) {
+        try {
+          final userSnap = await _getDocCacheThenServer(fs.collection("users").doc(uid));
+          final u = userSnap.data() ?? <String, dynamic>{};
+          movedByName = (u["name"] ?? "").toString().trim();
+        } catch (_) {}
+      }
+
+      final batch = fs.batch();
+
+      for (final folderId in _selectedFolderIds) {
+        final folderSnap = await _getDocCacheThenServer(_foldersRef().doc(folderId));
+        if (!folderSnap.exists) continue;
+
+        final data = folderSnap.data() ?? <String, dynamic>{};
+        final oldParentId = data["parentId"] as String?;
+        if (oldParentId == pickedParent) continue;
+
+        final folderName = (data["name"] ?? "").toString().trim();
+        final paths = await FolderPaths.buildMovePathsNoRoot(
+          fs: fs,
+          tenantId: widget.tenantId,
+          oldParentId: oldParentId,
+          newParentId: pickedParent,
+          entityName: folderName.isEmpty ? "(folder)" : folderName,
+        );
+
+        batch.update(_foldersRef().doc(folderId), {"parentId": pickedParent});
+        batch.set(_movementHistoryRef().doc(), {
+          "type": "folder",
+          "entityId": folderId,
+          "name": folderName,
+          "oldPathNames": paths["old"],
+          "newPathNames": paths["new"],
+          "movedAt": FieldValue.serverTimestamp(),
+          "movedBy": uid,
+          "movedByName": movedByName,
+        });
+      }
+
+      for (final productId in _selectedProductIds) {
+        final productRef = _productsRef().doc(productId);
+        final productSnap = await _getDocCacheThenServer(productRef);
+        if (!productSnap.exists) continue;
+
+        final data = productSnap.data() ?? <String, dynamic>{};
+        final oldFolderId = data["folderId"] as String?;
+        if (oldFolderId == pickedParent) continue;
+
+        final code = (data["code"] ?? productId).toString().trim();
+        final paths = await FolderPaths.buildMovePathsNoRoot(
+          fs: fs,
+          tenantId: widget.tenantId,
+          oldParentId: oldFolderId,
+          newParentId: pickedParent,
+          entityName: code.isEmpty ? "(item)" : code,
+        );
+
+        final updateData = <String, dynamic>{
+          "folderId": pickedParent,
+          "updatedAt": FieldValue.serverTimestamp(),
+        };
+
+        final pickedFolderSnap = await _getDocCacheThenServer(_foldersRef().doc(pickedParent));
+        final pickedFolderData = pickedFolderSnap.data() ?? <String, dynamic>{};
+        if (!_isProtectedFolder(pickedFolderData)) {
+          updateData["originalFolderId"] = pickedParent;
+        }
+
+        batch.update(productRef, updateData);
+        batch.set(_movementHistoryRef().doc(), {
+          "type": "product",
+          "entityId": productId,
+          "name": code,
+          "oldPathNames": paths["old"],
+          "newPathNames": paths["new"],
+          "movedAt": FieldValue.serverTimestamp(),
+          "movedBy": uid,
+          "movedByName": movedByName,
+        });
+      }
+
+      await batch.commit();
+
+      if (!mounted || _isSignedOut() || _handledSignedOut) return;
+      _showSuccessToast("Selected items moved.");
+      _clearSelection();
+    } catch (e) {
+      if (_isAuthOrPermissionError(e)) return;
+      if (!mounted || _isSignedOut() || _handledSignedOut) return;
+      _showErrorToast("Failed to move selected items.");
+    }
+  }
+
   //dialog closing helpers
   void _safeCloseDialog(NavigatorState navigator) { //closes dialog immediately
     if (navigator.mounted && navigator.canPop()) {
@@ -565,67 +998,6 @@ class _FilesContentState extends State<_FilesContent> {
         navigator.pop();
       }
     });
-  }
-
-  //image crop helper
-  Future<XFile> _autoCenterCropTo4by3(
-      XFile input, {
-        int jpegQuality = 85, //crop it to 4:3 from the middle
-      }) async {
-    final Uint8List bytes = await input.readAsBytes(); //read raw bytes from the image
-
-    img.Image? decoded = img.decodeImage(bytes); //decode bytes into editable image object
-    if (decoded == null) {
-      throw Exception("Could not read image data."); //decode fail message
-    }
-
-    decoded = img.bakeOrientation(decoded); //proper image orientation
-
-    final int w = decoded.width;
-    final int h = decoded.height;
-
-    const double target = 4 / 3; //target aspect ratio 4:3
-
-    int cropW = w;
-    int cropH = h;
-
-    if (w / h > target) {
-      cropW = (h * target).round();
-      cropH = h;
-    } else {
-      cropW = w;
-      cropH = (w / target).round();
-    }
-
-    final int x = ((w - cropW) / 2).round();
-    final int y = ((h - cropH) / 2).round();
-
-    //crop image
-    final img.Image cropped = img.copyCrop(
-      decoded,
-      x: x,
-      y: y,
-      width: cropW,
-      height: cropH,
-    );
-
-    final List<int> outJpg = img.encodeJpg(cropped, quality: jpegQuality); //re-encodes as JPEG with chosen quality
-
-    //if on web then creates an in-memory x-file
-    if (kIsWeb) {
-      return XFile.fromData(
-        Uint8List.fromList(outJpg),
-        name: "cropped_4x3.jpg",
-        mimeType: "image/jpeg",
-      );
-    } else { //on mobile save the image to temporary storage
-      final dir = await getTemporaryDirectory();
-      final path =
-          "${dir.path}/cropped_4x3_${DateTime.now().millisecondsSinceEpoch}.jpg";
-      final file = File(path);
-      await file.writeAsBytes(outJpg, flush: true);
-      return XFile(file.path);
-    }
   }
 
   //when user chose camera or gallery
@@ -650,26 +1022,14 @@ class _FilesContentState extends State<_FilesContent> {
       return;
     }
 
-    try {
-      final XFile cropped =
-      await _autoCenterCropTo4by3(picked, jpegQuality: 85);
-
-      if (!mounted || _isSignedOut() || _handledSignedOut) return;
-
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => NewItemScreen(
-            folderId: null,
-            initialImage: cropped,
-          ),
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NewItemScreen(
+          folderId: null,
+          initialImage: picked,
         ),
-      );
-    } catch (_) {
-      if (!mounted || _isSignedOut() || _handledSignedOut) return;
-      _showErrorToast( //crop error message
-        "The image could not be processed. Please try another photo.",
-      );
-    }
+      ),
+    );
   }
 
   //admin add action
@@ -1041,6 +1401,20 @@ class _FilesContentState extends State<_FilesContent> {
     return ids;
   }
 
+
+  Future<void> _deleteProductStorageImage(String productId) async {
+    try {
+      await FirebaseStorage.instance
+          .ref("tenants/${widget.tenantId}/products/$productId/main.jpg")
+          .delete();
+    } on FirebaseException catch (e) {
+      if (e.code == "object-not-found") {
+        return;
+      }
+      rethrow;
+    }
+  }
+
   //delete folder recursively
   Future<void> _deleteFolderRecursive(String folderId) async {
     final itemsSnap = await _getQueryCacheThenServer(
@@ -1048,11 +1422,15 @@ class _FilesContentState extends State<_FilesContent> {
     );
 
     for (final item in itemsSnap.docs) {
-      //delete offline cache image first, then delete firestore product
+      // Delete the Firebase Storage image first, then the offline cache,
+      // then the Firestore product document.
+      await _deleteProductStorageImage(item.id);
+
       await OfflineMediaService.instance.deleteOfflineImage(
         tenantId: widget.tenantId,
         productId: item.id,
       );
+
       await item.reference.delete();
     }
 
@@ -1170,6 +1548,7 @@ class _FilesContentState extends State<_FilesContent> {
     );
 
     return snap.docs.where((d) {
+      if (!_canSeeFolderDoc(d)) return false;
       final data = d.data();
       final name = (data["name"] ?? "").toString().toLowerCase();
       return name.contains(qLower);
@@ -1211,8 +1590,8 @@ class _FilesContentState extends State<_FilesContent> {
       map[d.id] = d;
     }
 
-    //prefetch images and return results
-    final results = map.values.toList();
+    //prefetch images and return only products inside visible folders
+    final results = map.values.where(_canSeeProductDoc).toList();
     await _prefetchProducts(results);
     return results;
   }
@@ -1285,7 +1664,7 @@ class _FilesContentState extends State<_FilesContent> {
 
       setState(() {
         _folderResults = _filterOutDeletingFolders(folders);
-        _itemResults = items;
+        _itemResults = items.where(_canSeeProductDoc).toList();
         _lastCompletedSearchQuery = query;
         _isSearching = false;
       });
@@ -1330,7 +1709,9 @@ class _FilesContentState extends State<_FilesContent> {
     final data = productDoc.data();
     final folderId = (data["folderId"] ?? "").toString(); //get folderId from item
 
-    if (folderId.isEmpty || _isFolderDeleting(folderId)) return;
+    if (folderId.isEmpty || _isFolderDeleting(folderId) || !_canSeeFolderId(folderId)) {
+      return;
+    }
 
     try {
       final folderSnap =
@@ -1346,6 +1727,7 @@ class _FilesContentState extends State<_FilesContent> {
           builder: (_) => ItemsScreen(
             folderId: folderId,
             folderName: folderName.isEmpty ? "Folder" : folderName,
+            highlightedItemId: productDoc.id,
           ),
         ),
       );
@@ -1403,81 +1785,95 @@ class _FilesContentState extends State<_FilesContent> {
       }());
     }
 
+    final isSelected = _selectedProductIds.contains(p.id);
+
     return GestureDetector(
-      onTap: () => _openFolderFromProduct(p),
-      child: Container(
-        decoration: BoxDecoration(
-          border: Border.all(color: Colors.grey.shade300),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Column(
-          children: [
-            Expanded(
-              child: ClipRRect(
-                borderRadius:
-                const BorderRadius.vertical(top: Radius.circular(12)),
-                child: imageUrl.isNotEmpty
-                    ? OfflineImageWidget(
-                  tenantId: widget.tenantId,
-                  productId: p.id,
-                  imageUrl: imageUrl,
-                  fit: BoxFit.cover,
-                  width: double.infinity,
-                  errorWidget: Container(
-                    color: Colors.grey.shade100,
-                    alignment: Alignment.center,
-                    child: const Icon(
-                      Icons.inventory_2_outlined,
-                      size: 60,
-                      color: Colors.grey,
+      onTap: () {
+        if (_isSelectionMode && widget.isAdmin) {
+          _toggleProductSelection(p.id);
+          return;
+        }
+        _openFolderFromProduct(p);
+      },
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.grey.shade300),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              children: [
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius:
+                    const BorderRadius.vertical(top: Radius.circular(12)),
+                    child: imageUrl.isNotEmpty
+                        ? OfflineImageWidget(
+                      tenantId: widget.tenantId,
+                      productId: p.id,
+                      imageUrl: imageUrl,
+                      fit: BoxFit.cover,
+                      width: double.infinity,
+                      errorWidget: Container(
+                        color: Colors.grey.shade100,
+                        alignment: Alignment.center,
+                        child: const Icon(
+                          Icons.inventory_2_outlined,
+                          size: 60,
+                          color: Colors.grey,
+                        ),
+                      ),
+                    )
+                        : Container(
+                      color: Colors.grey.shade100,
+                      alignment: Alignment.center,
+                      child: const Icon(
+                        Icons.inventory_2,
+                        size: 60,
+                      ),
                     ),
                   ),
-                )
-                    : Container(
-                  color: Colors.grey.shade100,
-                  alignment: Alignment.center,
-                  child: const Icon(
-                    Icons.inventory_2,
-                    size: 60,
+                ),
+                const SizedBox(height: 6),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Text(
+                    code.isEmpty ? "(no code)" : code,
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ),
-              ),
-            ),
-            const SizedBox(height: 6),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Text(
-                code.isEmpty ? "(no code)" : code,
-                textAlign: TextAlign.center,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
-            ),
-            if (breadcrumb.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
-                child: Text(
-                  breadcrumb,
-                  textAlign: TextAlign.center,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: Colors.black54,
+                if (breadcrumb.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+                    child: Text(
+                      breadcrumb,
+                      textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.black54,
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 4),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    stock.isEmpty ? "" : "Stock: $stock",
+                    style: const TextStyle(fontSize: 12),
                   ),
                 ),
-              ),
-            const SizedBox(height: 4),
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Text(
-                stock.isEmpty ? "" : "Stock: $stock",
-                style: const TextStyle(fontSize: 12),
-              ),
+              ],
             ),
-          ],
-        ),
+          ),
+          if (widget.isAdmin && isSelected) _selectionOverlay(selected: isSelected),
+        ],
       ),
     );
   }
@@ -1523,7 +1919,8 @@ class _FilesContentState extends State<_FilesContent> {
         _topFoldersErrorShown = false;
 
         final folders = snapshot.data!.docs
-            .where((folder) => !_isFolderDeleting(folder.id))
+            .where((folder) =>
+        !_isFolderDeleting(folder.id) && _canSeeFolderDoc(folder))
             .toList();
 
         if (folders.isEmpty) {
@@ -1554,40 +1951,49 @@ class _FilesContentState extends State<_FilesContent> {
             final canManageFolder =
                 widget.isAdmin && !_isProtectedFolder(folderData);
 
-            return FolderGridTile(
-              folderName: folderName,
-              breadcrumb: "",
-              isAdmin: canManageFolder,
-              onTap: () {
-                if (_isFolderDeleting(folderId)) return;
+            return _wrapSelectableTile(
+              id: folderId,
+              isFolder: true,
+              canSelect: canManageFolder,
+              child: FolderGridTile(
+                folderName: folderName,
+                breadcrumb: "",
+                isAdmin: canManageFolder && !_isSelectionMode,
+                onTap: () {
+                  if (_isFolderDeleting(folderId)) return;
+                  if (_isSelectionMode && canManageFolder) {
+                    _toggleFolderSelection(folderId);
+                    return;
+                  }
 
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => ItemsScreen(
-                      folderId: folderId,
-                      folderName: folderName,
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => ItemsScreen(
+                        folderId: folderId,
+                        folderName: folderName,
+                      ),
                     ),
-                  ),
-                );
-              },
-              onRename: () async {
-                if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
-                  return;
-                }
-                await _renameFolder(folderId, folderName);
-              },
-              onMove: () async {
-                if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
-                  return;
-                }
-                await _moveFolder(folderId);
-              },
-              onDelete: () async {
-                if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
-                  return;
-                }
-                await _confirmDeleteFolder(folderId, folderName);
-              },
+                  );
+                },
+                onRename: () async {
+                  if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
+                    return;
+                  }
+                  await _renameFolder(folderId, folderName);
+                },
+                onMove: () async {
+                  if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
+                    return;
+                  }
+                  await _moveFolder(folderId);
+                },
+                onDelete: () async {
+                  if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
+                    return;
+                  }
+                  await _confirmDeleteFolder(folderId, folderName);
+                },
+              ),
             );
           },
         );
@@ -1603,8 +2009,9 @@ class _FilesContentState extends State<_FilesContent> {
       );
     }
 
-    final visibleFolders =
-    _folderResults.where((folder) => !_isFolderDeleting(folder.id)).toList();
+    final visibleFolders = _folderResults
+        .where((folder) => !_isFolderDeleting(folder.id) && _canSeeFolderDoc(folder))
+        .toList();
 
     if (visibleFolders.isEmpty &&
         !_isSearching &&
@@ -1634,41 +2041,50 @@ class _FilesContentState extends State<_FilesContent> {
         final canManageFolder = widget.isAdmin && !_isProtectedFolder(f);
         final breadcrumb = _folderBreadcrumbCache[folderId] ?? "";
 
-        return FolderGridTile(
-          folderName: folderName,
-          breadcrumb: breadcrumb,
-          isAdmin: canManageFolder,
-          iconSize: 110,
-          onTap: () {
-            if (_isFolderDeleting(folderId)) return;
+        return _wrapSelectableTile(
+          id: folderId,
+          isFolder: true,
+          canSelect: canManageFolder,
+          child: FolderGridTile(
+            folderName: folderName,
+            breadcrumb: breadcrumb,
+            isAdmin: canManageFolder && !_isSelectionMode,
+            iconSize: 110,
+            onTap: () {
+              if (_isFolderDeleting(folderId)) return;
+              if (_isSelectionMode && canManageFolder) {
+                _toggleFolderSelection(folderId);
+                return;
+              }
 
-            Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => ItemsScreen(
-                  folderId: folderId,
-                  folderName: folderName,
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => ItemsScreen(
+                    folderId: folderId,
+                    folderName: folderName,
+                  ),
                 ),
-              ),
-            );
-          },
-          onRename: () async {
-            if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
-              return;
-            }
-            await _renameFolder(folderId, folderName);
-          },
-          onMove: () async {
-            if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
-              return;
-            }
-            await _moveFolder(folderId);
-          },
-          onDelete: () async {
-            if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
-              return;
-            }
-            await _confirmDeleteFolder(folderId, folderName);
-          },
+              );
+            },
+            onRename: () async {
+              if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
+                return;
+              }
+              await _renameFolder(folderId, folderName);
+            },
+            onMove: () async {
+              if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
+                return;
+              }
+              await _moveFolder(folderId);
+            },
+            onDelete: () async {
+              if (!mounted || _isSignedOut() || _isFolderDeleting(folderId)) {
+                return;
+              }
+              await _confirmDeleteFolder(folderId, folderName);
+            },
+          ),
         );
       },
     );
@@ -1743,22 +2159,44 @@ class _FilesContentState extends State<_FilesContent> {
           child: Scaffold(
             resizeToAvoidBottomInset: true,
             appBar: AppBar(
-              title: const Text(
-                "Files",
-                style: TextStyle(color: Colors.white),
+              title: Text(
+                _isSelectionMode ? "$_selectedCount selected" : "Files",
+                style: const TextStyle(color: Colors.white),
               ),
               backgroundColor: const Color(0xff0B1E40),
               centerTitle: false,
               titleSpacing: 16,
               automaticallyImplyLeading: false,
-              leadingWidth: 0,
-              leading: null,
+              leadingWidth: _isSelectionMode ? null : 0,
+              leading: _isSelectionMode
+                  ? IconButton(
+                icon: const Icon(Icons.close, color: Colors.white),
+                onPressed: _clearSelection,
+              )
+                  : null,
+              actions: _isSelectionMode
+                  ? [
+                IconButton(
+                  tooltip: "Move selected",
+                  icon: const Icon(Icons.drive_file_move_outline, color: Colors.white),
+                  onPressed: _selectedCount > 0 ? _showMoveSelectedDialog : null,
+                ),
+              ]
+                  : widget.isAdmin
+                  ? [
+                IconButton(
+                  tooltip: "Select items",
+                  icon: const Icon(Icons.task_alt, color: Colors.white),
+                  onPressed: _startSelection,
+                ),
+              ]
+                  : null,
             ),
             //if admin fab is centered
             floatingActionButtonLocation: widget.isAdmin
                 ? FloatingActionButtonLocation.centerDocked
                 : null,
-            floatingActionButton: widget.isAdmin && !keyboardOpen
+            floatingActionButton: widget.isAdmin && !keyboardOpen && !_isSelectionMode
                 ? FloatingActionButton(
               heroTag: null,
               backgroundColor: const Color(0xff0B1E40),

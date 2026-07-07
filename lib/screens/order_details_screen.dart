@@ -10,9 +10,11 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 
+import '../services/offline_media_service.dart';
 import '../services/out_of_stock_service.dart';
 import '../services/tenant_context_service.dart';
 import '../widgets/bottom_nav.dart';
+import '../widgets/offline_image_widget.dart';
 import '../widgets/top_toast.dart';
 import 'orders_screen.dart';
 
@@ -23,9 +25,22 @@ class _SilentReturnException implements Exception {
 class OrderDetailsScreen extends StatefulWidget {
   final String orderId;
 
+  /// When true, pressing back from this order returns to OrdersScreen instead
+  /// of popping back to the previous screen. Use this only for active orders
+  /// opened from the ItemsScreen / bottom navigation flow.
+  final bool goToOrdersOnBack;
+
+  /// Kept for compatibility with older navigation calls.
+  /// The Files bottom-nav target is now handled by LastItemsScreenService.
+  final String? returnToFolderId;
+  final String? returnToFolderName;
+
   const OrderDetailsScreen({
     super.key,
     required this.orderId,
+    this.goToOrdersOnBack = false,
+    this.returnToFolderId,
+    this.returnToFolderName,
   });
 
   @override
@@ -246,6 +261,11 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   Future<void> _safePopBack() async {
     if (!mounted || _isLeavingScreen) return;
 
+    if (widget.goToOrdersOnBack) {
+      await _safeReplaceToOrders();
+      return;
+    }
+
     final navigator = Navigator.of(context);
 
     _isLeavingScreen = true;
@@ -256,13 +276,18 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
 
     if (!mounted) return;
 
+    // Normal back must return to the exact screen that opened this order.
+    // Example: All My Orders -> OrderDetailsScreen returns to All My Orders.
+    // Example: ShopOrdersScreen -> OrderDetailsScreen returns to that shop order list.
     if (navigator.canPop()) {
       navigator.pop();
       return;
     }
 
-    navigator.pushReplacement(
+    // Safety fallback only if the details screen has no previous route.
+    navigator.pushAndRemoveUntil(
       MaterialPageRoute(builder: (_) => const OrdersScreen()),
+          (route) => false,
     );
   }
 
@@ -279,8 +304,9 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
 
     if (!mounted) return;
 
-    navigator.pushReplacement(
+    navigator.pushAndRemoveUntil(
       MaterialPageRoute(builder: (_) => const OrdersScreen()),
+          (route) => false,
     );
   }
 
@@ -312,6 +338,49 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
 
   DocumentReference<Map<String, dynamic>> _userRef(String uid) {
     return FirebaseFirestore.instance.collection("users").doc(uid);
+  }
+
+  String _firstNonEmptyText(Map<String, dynamic> data, List<String> keys) {
+    for (final key in keys) {
+      final value = (data[key] ?? "").toString().trim();
+      if (value.isNotEmpty) return value;
+    }
+    return "";
+  }
+
+  String _movementShopName(Map<String, dynamic> orderData) {
+    return _firstNonEmptyText(orderData, [
+      "shopName",
+      "orderShopName",
+      "soldShopName",
+      "undoShopName",
+      "shop",
+      "name",
+    ]);
+  }
+
+  Future<String> _movementUserName(String uid) async {
+    final currentUser = FirebaseAuth.instance.currentUser;
+    final displayName = (currentUser?.displayName ?? "").trim();
+    if (displayName.isNotEmpty) return displayName;
+
+    try {
+      final userSnap = await _tryGetDocServerThenCache(_userRef(uid));
+      final userData = userSnap?.data() ?? <String, dynamic>{};
+      final name = _firstNonEmptyText(userData, [
+        "name",
+        "fullName",
+        "displayName",
+        "userName",
+        "email",
+      ]);
+      if (name.isNotEmpty) return name;
+    } catch (_) {}
+
+    final email = (currentUser?.email ?? "").trim();
+    if (email.isNotEmpty) return email;
+
+    return "";
   }
 
   DocumentReference<Map<String, dynamic>> _wholesalePriceRef({
@@ -541,11 +610,43 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     final tree = _buildTree(itemDocs);
     final List<_ScreenSection> sections = [];
 
+    bool hasItemsDeep(FolderNode node) {
+      if (node.items.isNotEmpty) return true;
+      return node.children.values.any(hasItemsDeep);
+    }
+
     void collectSections(FolderNode node, {required int depth}) {
       final children = node.children.values.toList()
         ..sort((a, b) => a.name.compareTo(b.name));
 
       for (final c in children) {
+        final childHasItemsDeep = hasItemsDeep(c);
+
+        if (childHasItemsDeep && c.items.isEmpty) {
+          sections.add(
+            _ScreenSection(
+              title: c.name,
+              depth: depth,
+              rows: [
+                {
+                  "orderItemId": "",
+                  "productId": "",
+                  "code": "",
+                  "size": "",
+                  "qty": 0,
+                  "wholesalePrice": null,
+                  "folderPathNames": const [],
+                  "showFolder": true,
+                  "showCode": false,
+                  "folder": c.name,
+                  "isMainFolder": depth == 0,
+                  "isFolderHeader": true,
+                },
+              ],
+            ),
+          );
+        }
+
         if (c.items.isNotEmpty) {
           final rows = <Map<String, dynamic>>[];
           String previousCode = "";
@@ -833,6 +934,9 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         throw Exception("This order is not exported.");
       }
 
+      final movementShopName = _movementShopName(orderData);
+      final movementByName = await _movementUserName(uid);
+
       final batch = fs.batch();
       final year = DateTime.now().year;
 
@@ -867,6 +971,8 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           if (size.isNotEmpty) "sizeDelta": {size: qty},
           "at": FieldValue.serverTimestamp(),
           "by": uid,
+          if (movementByName.isNotEmpty) "byName": movementByName,
+          if (movementShopName.isNotEmpty) "shopName": movementShopName,
           "year": year,
           "orderId": widget.orderId,
         });
@@ -1012,11 +1118,39 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       final tree = _buildTreeFromMaps(enrichedItems);
       final List<_PdfSection> sections = [];
 
+      bool hasItemsDeep(FolderNode node) {
+        if (node.items.isNotEmpty) return true;
+        return node.children.values.any(hasItemsDeep);
+      }
+
       void collectSections(FolderNode node, {required int depth}) {
         final children = node.children.values.toList()
           ..sort((a, b) => a.name.compareTo(b.name));
 
         for (final c in children) {
+          final childHasItemsDeep = hasItemsDeep(c);
+
+          if (childHasItemsDeep && c.items.isEmpty) {
+            sections.add(
+              _PdfSection(
+                title: c.name,
+                items: [
+                  _PdfRow(
+                    folder: c.name,
+                    code: "",
+                    qtyWithSize: "",
+                    wholesalePrice: "",
+                    showFolder: true,
+                    showCode: false,
+                    isMainFolder: depth == 0,
+                    isFolderHeader: true,
+                  ),
+                ],
+                depth: depth,
+              ),
+            );
+          }
+
           if (c.items.isNotEmpty) {
             final rows = <_PdfRow>[];
             String previousCode = "";
@@ -1037,6 +1171,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                   showFolder: i == 0,
                   showCode: i == 0 || code != previousCode,
                   isMainFolder: depth == 0,
+                  isFolderHeader: false,
                 ),
               );
 
@@ -1061,16 +1196,23 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       pw.Widget sectionBlock(_PdfSectionPart part) {
         final indent = part.depth * 10.0;
 
+        final isOnlyFolderHeader =
+            part.rows.length == 1 && part.rows.first.isFolderHeader;
+
         return pw.Container(
-          margin: const pw.EdgeInsets.only(bottom: 8),
+          margin: pw.EdgeInsets.only(bottom: isOnlyFolderHeader ? 0 : 8),
           padding: pw.EdgeInsets.only(left: indent),
           child: pw.Column(
             crossAxisAlignment: pw.CrossAxisAlignment.start,
             children: [
               ...part.rows.map(
                     (r) => pw.Container(
-                  padding: const pw.EdgeInsets.symmetric(vertical: 4),
-                  decoration: const pw.BoxDecoration(
+                  padding: r.isFolderHeader
+                      ? const pw.EdgeInsets.only(top: 1, bottom: 0)
+                      : const pw.EdgeInsets.only(top: 2, bottom: 4),
+                  decoration: r.isFolderHeader
+                      ? null
+                      : const pw.BoxDecoration(
                     border: pw.Border(
                       bottom: pw.BorderSide(
                         color: PdfColors.blueGrey100,
@@ -1141,6 +1283,11 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       }
 
       double estimatePartH(_PdfSectionPart p) {
+        final isOnlyFolderHeader =
+            p.rows.length == 1 && p.rows.first.isFolderHeader;
+        if (isOnlyFolderHeader) {
+          return cardBaseH + rowH;
+        }
         return cardBaseH + (p.rows.length * rowH) + cardGapH;
       }
 
@@ -1171,6 +1318,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                 showFolder: j == 0,
                 showCode: j == 0 || row.code != previousCodeInChunk,
                 isMainFolder: row.isMainFolder,
+                isFolderHeader: row.isFolderHeader,
               ),
             );
             previousCodeInChunk = row.code;
@@ -1356,6 +1504,9 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         throw Exception("This order is already exported.");
       }
 
+      final movementShopName = _movementShopName(freshOrderData);
+      final movementByName = await _movementUserName(uid);
+
       final batch = fs.batch();
       final year = DateTime.now().year;
       final productIds = <String>{};
@@ -1392,6 +1543,8 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           if (size.isNotEmpty) "sizeDelta": {size: -qty},
           "at": FieldValue.serverTimestamp(),
           "by": uid,
+          if (movementByName.isNotEmpty) "byName": movementByName,
+          if (movementShopName.isNotEmpty) "shopName": movementShopName,
           "year": year,
           "orderId": widget.orderId,
         });
@@ -1555,7 +1708,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         title: const Text("Order", style: TextStyle(color: Colors.white)),
       ),
       body: const Center(child: Text("Not signed in.")),
-      bottomNavigationBar: const BottomNav(
+      bottomNavigationBar: BottomNav(
         currentIndex: 2,
         hasFab: false,
         isRootScreen: false,
@@ -1564,8 +1717,8 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   }
 
   Widget _buildLoadingScaffold() {
-    return const Scaffold(
-      body: Center(child: CircularProgressIndicator()),
+    return Scaffold(
+      body: const Center(child: CircularProgressIndicator()),
       bottomNavigationBar: BottomNav(
         currentIndex: 2,
         hasFab: false,
@@ -1586,7 +1739,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           child: Text(message, textAlign: TextAlign.center),
         ),
       ),
-      bottomNavigationBar: const BottomNav(
+      bottomNavigationBar: BottomNav(
         currentIndex: 2,
         hasFab: false,
         isRootScreen: false,
@@ -1666,7 +1819,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                 ),
               ),
             ),
-            if (canEdit) const SizedBox(width: 40),
+            const SizedBox(width: 40),
           ],
         ),
         const SizedBox(height: 6),
@@ -1773,6 +1926,135 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     );
   }
 
+
+  Future<void> _showProductImage({
+    required String tenantId,
+    required String productId,
+    required String code,
+  }) async {
+    if (productId.trim().isEmpty) {
+      _toastRed("Product not found.");
+      return;
+    }
+
+    try {
+      final productSnap = await _tryGetDocServerThenCache(
+        _productsCol(tenantId).doc(productId),
+      );
+
+      if (productSnap == null || !productSnap.exists) {
+        _toastRed("Product not found.");
+        return;
+      }
+
+      final data = productSnap.data() ?? <String, dynamic>{};
+
+      final imageUrl = (data["imageUrl"] ??
+          data["mainImageUrl"] ??
+          data["photoUrl"] ??
+          data["image"])
+          ?.toString()
+          .trim();
+
+      if (imageUrl == null || imageUrl.isEmpty) {
+        _toastRed("No image available for this product.");
+        return;
+      }
+
+      try {
+        await OfflineMediaService.instance.ensureOfflineImage(
+          tenantId: tenantId,
+          productId: productId,
+          imageUrl: imageUrl,
+        );
+      } catch (_) {
+        // If offline, ignore. OfflineImageWidget will try the cached image first.
+      }
+
+      if (!mounted || _isLeavingScreen) return;
+
+      double dragDistance = 0;
+
+      showGeneralDialog<void>(
+        context: context,
+        barrierDismissible: true,
+        barrierLabel: "Close product image",
+        barrierColor: Colors.transparent,
+        transitionDuration: const Duration(milliseconds: 160),
+        pageBuilder: (dialogContext, animation, secondaryAnimation) {
+          return SafeArea(
+            child: Material(
+              color: Colors.transparent,
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onVerticalDragUpdate: (details) {
+                      dragDistance += details.delta.dy;
+                    },
+                    onVerticalDragEnd: (_) {
+                      if (dragDistance > 60) {
+                        Navigator.of(dialogContext).pop();
+                      }
+                      dragDistance = 0;
+                    },
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: AspectRatio(
+                            aspectRatio: 4 / 3,
+                            child: OfflineImageWidget(
+                              tenantId: tenantId,
+                              productId: productId,
+                              imageUrl: imageUrl,
+                              fit: BoxFit.cover,
+                              errorWidget: Container(
+                                color: Colors.white,
+                                child: const Center(
+                                  child: Text("Could not load image."),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          top: 8,
+                          right: 8,
+                          child: GestureDetector(
+                            onTap: () => Navigator.of(dialogContext).pop(),
+                            child: Container(
+                              width: 34,
+                              height: 34,
+                              decoration: BoxDecoration(
+                                color: Colors.black.withOpacity(0.45),
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.close,
+                                color: Colors.white,
+                                size: 22,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      );
+    } catch (e) {
+      if (_isPermissionDenied(e)) return;
+      _toastRed("Failed to load image: ${_cleanErr(e)}");
+    }
+  }
+
   Widget _sectionRow({
     required Map<String, dynamic> row,
     required int depth,
@@ -1790,10 +2072,15 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     final showFolder = row["showFolder"] == true;
     final showCode = row["showCode"] == true;
     final isMainFolder = row["isMainFolder"] == true;
+    final isFolderHeader = row["isFolderHeader"] == true;
 
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      decoration: BoxDecoration(
+      padding: isFolderHeader
+          ? const EdgeInsets.only(top: 2, bottom: 0)
+          : const EdgeInsets.only(top: 2, bottom: 6),
+      decoration: isFolderHeader
+          ? null
+          : BoxDecoration(
         border: Border(
           bottom: BorderSide(
             color: Colors.blueGrey.shade100,
@@ -1821,10 +2108,31 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           const SizedBox(width: 10),
           Expanded(
             flex: 3,
-            child: Text(
-              showCode ? code : "",
+            child: showCode && code.trim().isNotEmpty && !isFolderHeader
+                ? InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: () => _showProductImage(
+                tenantId: tenantId,
+                productId: productId,
+                code: code,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Text(
+                  code,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    decoration: TextDecoration.underline,
+                  ),
+                ),
+              ),
+            )
+                : const Text(
+              "",
               textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 14),
+              style: TextStyle(fontSize: 14),
             ),
           ),
           const SizedBox(width: 10),
@@ -1832,7 +2140,9 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
             flex: 4,
             child: Align(
               alignment: Alignment.center,
-              child: _qtyEditor(
+              child: isFolderHeader
+                  ? const SizedBox.shrink()
+                  : _qtyEditor(
                 tenantId: tenantId,
                 uid: uid,
                 role: role,
@@ -1846,7 +2156,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           ),
           SizedBox(
             width: 40,
-            child: canEdit
+            child: canEdit && !isFolderHeader
                 ? IconButton(
               padding: EdgeInsets.zero,
               iconSize: 18,
@@ -1872,8 +2182,11 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     required String role,
     required bool canEdit,
   }) {
+    final isOnlyFolderHeader =
+        section.rows.length == 1 && section.rows.first["isFolderHeader"] == true;
+
     return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
+      padding: EdgeInsets.only(bottom: isOnlyFolderHeader ? 0 : 10),
       child: Column(
         children: section.rows
             .map(
@@ -1890,6 +2203,8 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       ),
     );
   }
+
+
 
   @override
   Widget build(BuildContext context) {
@@ -2022,7 +2337,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                     ),
                   ],
                 ),
-                bottomNavigationBar: const BottomNav(
+                bottomNavigationBar: BottomNav(
                   currentIndex: 2,
                   hasFab: false,
                   isRootScreen: false,
@@ -2099,6 +2414,24 @@ class _OrderAppBar extends StatelessWidget {
     required this.isSignedOutError,
   });
 
+  Widget _spacedActionIconButton({
+    required String tooltip,
+    required Widget icon,
+    required VoidCallback? onPressed,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 9),
+      child: IconButton(
+        tooltip: tooltip,
+        iconSize: 29,
+        constraints: const BoxConstraints.tightFor(width: 50, height: 48),
+        padding: EdgeInsets.zero,
+        icon: icon,
+        onPressed: onPressed,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
@@ -2143,94 +2476,92 @@ class _OrderAppBar extends StatelessWidget {
                 ),
               );
             } else {
-              if (isActive && !isExported) {
-                actions.add(
-                  TextButton(
-                    onPressed: onDelete,
-                    child: const Text(
-                      "DELETE",
-                      style: TextStyle(color: Colors.white),
-                    ),
-                  ),
-                );
-                actions.add(
-                  TextButton(
-                    onPressed: onFinish,
-                    child: const Text(
-                      "FINISH",
-                      style: TextStyle(color: Colors.white),
-                    ),
-                  ),
-                );
-              }
-
-              if (!isActive && !isExported) {
-                actions.add(
-                  TextButton(
-                    onPressed: onContinue,
-                    child: const Text(
-                      "CONTINUE",
-                      style: TextStyle(color: Colors.white),
-                    ),
-                  ),
-                );
-              }
-
-              if (canExport) {
-                actions.add(
-                  TextButton(
-                    onPressed: criticalActionsBlocked
-                        ? onReconnectExportBlocked
-                        : onExport,
-                    child: Text(
-                      isExportingPdf ? "EXPORTING..." : "EXPORT",
-                      style: TextStyle(
-                        color: criticalActionsBlocked
-                            ? Colors.white54
-                            : Colors.white,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                );
-              }
-
-              if (canUndo) {
-                actions.add(
-                  TextButton(
-                    onPressed: criticalActionsBlocked
-                        ? onReconnectUndoBlocked
-                        : onUndoExport,
-                    child: Text(
-                      "CANCEL ORDER",
-                      style: TextStyle(
-                        color: criticalActionsBlocked
-                            ? Colors.white54
-                            : Colors.white,
-                      ),
-                    ),
-                  ),
-                );
-              }
-
               if (isExported) {
-                actions.add(
-                  const Padding(
-                    padding: EdgeInsets.only(right: 12),
-                    child: Center(
-                      child: Text(
-                        "EXPORTED",
-                        style: TextStyle(
-                          color: Colors.white70,
-                          fontWeight: FontWeight.w600,
-                        ),
+                if (canUndo) {
+                  actions.add(
+                    _spacedActionIconButton(
+                      tooltip: "Undo export",
+                      icon: Icon(
+                        Icons.undo,
+                        color: criticalActionsBlocked
+                            ? Colors.white54
+                            : Colors.white,
                       ),
+                      onPressed: criticalActionsBlocked
+                          ? onReconnectUndoBlocked
+                          : onUndoExport,
                     ),
-                  ),
-                );
+                  );
+                }
+              } else {
+                if (isActive) {
+                  actions.add(
+                    _spacedActionIconButton(
+                      tooltip: "Delete",
+                      icon: const Icon(
+                        Icons.delete_outline,
+                        color: Colors.white,
+                      ),
+                      onPressed: onDelete,
+                    ),
+                  );
+                  actions.add(
+                    _spacedActionIconButton(
+                      tooltip: "Finish",
+                      icon: const Icon(
+                        Icons.check_circle_outline,
+                        color: Colors.white,
+                      ),
+                      onPressed: onFinish,
+                    ),
+                  );
+                }
+
+                if (!isActive) {
+                  actions.add(
+                    _spacedActionIconButton(
+                      tooltip: "Continue",
+                      icon: const Icon(
+                        Icons.play_arrow_rounded,
+                        color: Colors.white,
+                      ),
+                      onPressed: onContinue,
+                    ),
+                  );
+                }
+
+                if (canExport) {
+                  actions.add(
+                    _spacedActionIconButton(
+                      tooltip: "Export",
+                      icon: isExportingPdf
+                          ? const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white54,
+                        ),
+                      )
+                          : Icon(
+                        Icons.ios_share,
+                        color: criticalActionsBlocked
+                            ? Colors.white54
+                            : Colors.white,
+                      ),
+                      onPressed: criticalActionsBlocked
+                          ? onReconnectExportBlocked
+                          : onExport,
+                    ),
+                  );
+                }
               }
             }
           }
+        }
+
+        if (actions.isNotEmpty) {
+          actions.add(const SizedBox(width: 12));
         }
 
         return AppBar(
@@ -2480,6 +2811,7 @@ class _PdfRow {
   final bool showFolder;
   final bool showCode;
   final bool isMainFolder;
+  final bool isFolderHeader;
 
   _PdfRow({
     required this.folder,
@@ -2489,6 +2821,7 @@ class _PdfRow {
     required this.showFolder,
     required this.showCode,
     required this.isMainFolder,
+    required this.isFolderHeader,
   });
 }
 
