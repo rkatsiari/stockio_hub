@@ -7,6 +7,7 @@ import 'firebase_options.dart';
 import 'models/app_user.dart';
 import 'screens/auth_choice_screen.dart';
 import 'screens/files_screen.dart';
+import 'services/app_navigation.dart';
 import 'services/current_user_service.dart';
 import 'services/reconnect_sync_service.dart';
 
@@ -67,6 +68,14 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      // Lets services without their own BuildContext (e.g. ExportService)
+      // show feedback (TopToast, etc) from wherever the user currently is,
+      // even if they navigated away from the screen that started the work.
+      navigatorKey: AppNavigation.navigatorKey,
+      // Lets HomeScreen (via RouteAware) detect when it's covered by a
+      // pushed screen vs. when it's back on top, so ExportService knows
+      // when it's actually safe to pop the share sheet.
+      navigatorObservers: [AppNavigation.routeObserver],
       debugShowCheckedModeBanner: false,
       title: 'Inventory Management',
       theme: ThemeData(

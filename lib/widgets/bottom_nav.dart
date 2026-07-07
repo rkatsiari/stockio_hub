@@ -10,6 +10,7 @@ import '../screens/items_screen.dart';
 import '../screens/order_details_screen.dart';
 import '../screens/orders_screen.dart';
 import '../screens/profile_screen.dart';
+import '../services/export_service.dart';
 import '../services/last_items_screen_service.dart';
 import '../services/tenant_context_service.dart';
 
@@ -231,28 +232,46 @@ class BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return BottomAppBar(
-      shape: hasFab ? const CircularNotchedRectangle() : null,
-      notchMargin: hasFab ? 8.0 : 0.0,
-      child: SizedBox(
-        height: 60,
-        child: Row(
-          children: hasFab
-              ? [
-            _navButton(context, Icons.home, 0),
-            _navButton(context, Icons.folder, 1),
-            const SizedBox(width: 40),
-            _navButton(context, Icons.receipt_long, 2),
-            _navButton(context, Icons.person, 3),
-          ]
-              : [
-            _navButton(context, Icons.home, 0),
-            _navButton(context, Icons.folder, 1),
-            _navButton(context, Icons.receipt_long, 2),
-            _navButton(context, Icons.person, 3),
+    return ValueListenableBuilder<ExportJobState>(
+      // Thin progress line so an export started from Home (or anywhere
+      // else, in future) stays visible no matter which screen the user
+      // navigates to while it runs.
+      valueListenable: ExportService.instance.stateNotifier,
+      builder: (context, exportState, _) {
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (exportState.isExporting)
+              LinearProgressIndicator(
+                value: exportState.progress > 0 ? exportState.progress : null,
+                minHeight: 2,
+              ),
+            BottomAppBar(
+              shape: hasFab ? const CircularNotchedRectangle() : null,
+              notchMargin: hasFab ? 8.0 : 0.0,
+              child: SizedBox(
+                height: 60,
+                child: Row(
+                  children: hasFab
+                      ? [
+                    _navButton(context, Icons.home, 0),
+                    _navButton(context, Icons.folder, 1),
+                    const SizedBox(width: 40),
+                    _navButton(context, Icons.receipt_long, 2),
+                    _navButton(context, Icons.person, 3),
+                  ]
+                      : [
+                    _navButton(context, Icons.home, 0),
+                    _navButton(context, Icons.folder, 1),
+                    _navButton(context, Icons.receipt_long, 2),
+                    _navButton(context, Icons.person, 3),
+                  ],
+                ),
+              ),
+            ),
           ],
-        ),
-      ),
+        );
+      },
     );
   }
 }
