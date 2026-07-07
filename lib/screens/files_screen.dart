@@ -20,6 +20,18 @@ import 'items_screen.dart';
 import 'new_folder_screen.dart';
 import 'new_item_screen.dart';
 
+//shared auth/permission error helper (used by both FilesScreen and its content view)
+bool _isAuthOrPermissionError(Object error) {
+  final msg = error.toString().toLowerCase();
+  return msg.contains(TenantContextService.kSignedOutMessage.toLowerCase()) ||
+      msg.contains("permission-denied") ||
+      msg.contains("permission denied") ||
+      msg.contains("unauthenticated") ||
+      msg.contains("user is not signed in") ||
+      msg.contains("requires authentication") ||
+      msg.contains("user_signed_out");
+}
+
 Set<String>? _parseVisibleFolderIdsFromData(Map<String, dynamic> data) {
   if (!data.containsKey("visibleFolderIds")) return null;
 
@@ -117,18 +129,6 @@ class _FilesScreenState extends State<FilesScreen> {
   void dispose() {
     _authSub.cancel();
     super.dispose();
-  }
-
-  //error helpers
-  bool _isAuthOrPermissionError(Object error) { //auth or permission error
-    final msg = error.toString().toLowerCase();
-    return msg.contains(TenantContextService.kSignedOutMessage.toLowerCase()) ||
-        msg.contains("permission-denied") ||
-        msg.contains("permission denied") ||
-        msg.contains("unauthenticated") ||
-        msg.contains("user is not signed in") ||
-        msg.contains("requires authentication") ||
-        msg.contains("user_signed_out");
   }
 
   Future<_FilesBootstrapState> _buildBootstrapForUser(User? user) async {
@@ -468,6 +468,7 @@ class _FilesContentState extends State<_FilesContent> {
   bool _searchItemsErrorShown = false;
 
   final Set<String> _prefetchedProductIds = <String>{}; //store products whose offline image has been prefetch
+  final Set<String> _prefetchingProductIds = <String>{}; //in-flight guard so a failed prefetch can be retried later
   final Set<String> _selectedFolderIds = <String>{};
   final Set<String> _selectedProductIds = <String>{};
   bool _selectionStarted = false;
@@ -519,17 +520,6 @@ class _FilesContentState extends State<_FilesContent> {
 
   bool _isSignedOut() => FirebaseAuth.instance.currentUser == null;
 
-  bool _isAuthOrPermissionError(Object error) {
-    final msg = error.toString().toLowerCase();
-    return msg.contains(TenantContextService.kSignedOutMessage.toLowerCase()) ||
-        msg.contains("permission-denied") ||
-        msg.contains("permission denied") ||
-        msg.contains("unauthenticated") ||
-        msg.contains("user is not signed in") ||
-        msg.contains("requires authentication") ||
-        msg.contains("user_signed_out");
-  }
-
   bool _isNetworkLikeError(Object error) {
     final msg = error.toString().toLowerCase();
     return msg.contains("cloud_firestore/unavailable") ||
@@ -560,7 +550,7 @@ class _FilesContentState extends State<_FilesContent> {
         .collection("folders");
   }
 
-  CollectionReference<Map<String, dynamic>> _productsRef() { //return tenant’s products collection
+  CollectionReference<Map<String, dynamic>> _productsRef() { //return tenant's products collection
     return FirebaseFirestore.instance
         .collection("tenants")
         .doc(widget.tenantId)
@@ -635,7 +625,10 @@ class _FilesContentState extends State<_FilesContent> {
       final data = snap.data() ?? <String, dynamic>{};
       return _isProtectedFolder(data);
     } catch (_) {
-      return false;
+      // Couldn't verify the folder's protected status (e.g. a network
+      // hiccup) - fail closed rather than silently allowing a protected
+      // folder to be renamed/moved/deleted.
+      return true;
     }
   }
 
@@ -745,15 +738,15 @@ class _FilesContentState extends State<_FilesContent> {
         ? _selectedFolderIds.contains(id)
         : _selectedProductIds.contains(id);
 
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          child,
-          if (canSelect && selected) _selectionOverlay(selected: selected),
-        ],
-      ),
+    // Note: tapping is handled by the child widget itself (e.g. FolderGridTile's
+    // onTap, or the GestureDetector in _buildSearchProductCard) - this just
+    // layers the selection checkmark on top, so no extra gesture handling here.
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        child,
+        if (canSelect && selected) _selectionOverlay(selected: selected),
+      ],
     );
   }
 
@@ -866,7 +859,12 @@ class _FilesContentState extends State<_FilesContent> {
         _showErrorToast("Out of stock folders cannot be selected as a destination.");
         return;
       }
-    } catch (_) {}
+    } catch (_) {
+      // Couldn't verify the destination folder - fail closed instead of
+      // silently allowing a possibly-protected folder as the target.
+      _showErrorToast("Out of stock folders cannot be selected as a destination.");
+      return;
+    }
 
     _showSuccessToast("Moving selected items...");
 
@@ -891,7 +889,7 @@ class _FilesContentState extends State<_FilesContent> {
       if (uid.isNotEmpty) {
         try {
           final userSnap = await _getDocCacheThenServer(fs.collection("users").doc(uid));
-          final u = userSnap.data() ?? <String, dynamic>{};
+          final u = userSnap.data() ?? {};
           movedByName = (u["name"] ?? "").toString().trim();
         } catch (_) {}
       }
@@ -1087,20 +1085,32 @@ class _FilesContentState extends State<_FilesContent> {
       ) async {
     for (final p in products) {
       final productId = p.id;
-      if (_prefetchedProductIds.contains(productId)) continue; //skip if cached
+      //skip if already cached, or already being fetched
+      if (_prefetchedProductIds.contains(productId)) continue;
+      if (_prefetchingProductIds.contains(productId)) continue;
 
       final data = p.data();
       final imageUrl = (data["imageUrl"] ?? "").toString().trim();
       if (imageUrl.isEmpty) continue;
 
-      _prefetchedProductIds.add(productId);
+      _prefetchingProductIds.add(productId);
 
       unawaited(
-        OfflineMediaService.instance.ensureOfflineImage(
+        OfflineMediaService.instance
+            .ensureOfflineImage(
           tenantId: widget.tenantId,
           productId: productId,
           imageUrl: imageUrl,
-        ),
+        )
+            .then((_) {
+          //only remember it as done once it actually succeeds, so a failed
+          //fetch (e.g. while offline) can be retried on a later search
+          _prefetchedProductIds.add(productId);
+        }).catchError((_) {
+          //leave it out of _prefetchedProductIds so it can be retried
+        }).whenComplete(() {
+          _prefetchingProductIds.remove(productId);
+        }),
       );
     }
   }
@@ -1164,6 +1174,23 @@ class _FilesContentState extends State<_FilesContent> {
 
     final ctrl = TextEditingController(text: currentName); //prefilled with current name
 
+    Future<void> submitRename(NavigatorState dialogNavigator) async {
+      final newName = ctrl.text.trim();
+      _safeCloseDialogAfterUnfocus(dialogNavigator);
+
+      if (newName.isEmpty) return; //ignore empty name
+
+      try {
+        await _foldersRef().doc(folderId).update({"name": newName}); //update firestore folder document
+        if (!mounted || _isSignedOut() || _handledSignedOut) return;
+        _showSuccessToast("Folder renamed."); //success toast
+      } catch (e) {
+        if (_isAuthOrPermissionError(e)) return;
+        if (!mounted || _isSignedOut() || _handledSignedOut) return;
+        _showErrorToast("Failed to rename folder."); //rename error
+      }
+    }
+
     try {
       await showDialog<void>(
         context: context,
@@ -1177,22 +1204,7 @@ class _FilesContentState extends State<_FilesContent> {
               decoration: const InputDecoration(labelText: "New Folder Name"),
               textInputAction: TextInputAction.done,
               autofocus: true,
-              onSubmitted: (_) async {
-                final newName = ctrl.text.trim();
-                _safeCloseDialogAfterUnfocus(dialogNavigator);
-
-                if (newName.isEmpty) return; //ignore empty name
-
-                try {
-                  await _foldersRef().doc(folderId).update({"name": newName}); //update firestore folder document
-                  if (!mounted || _isSignedOut() || _handledSignedOut) return;
-                  _showSuccessToast("Folder renamed."); //success toast
-                } catch (e) {
-                  if (_isAuthOrPermissionError(e)) return;
-                  if (!mounted || _isSignedOut() || _handledSignedOut) return;
-                  _showErrorToast("Failed to rename folder."); //rename error
-                }
-              },
+              onSubmitted: (_) => submitRename(dialogNavigator),
             ),
             actions: [ //cancel button
               TextButton(
@@ -1200,22 +1212,7 @@ class _FilesContentState extends State<_FilesContent> {
                 child: const Text("Cancel"),
               ),
               TextButton(
-                onPressed: () async {
-                  final newName = ctrl.text.trim();
-                  _safeCloseDialogAfterUnfocus(dialogNavigator);
-
-                  if (newName.isEmpty) return;
-
-                  try {
-                    await _foldersRef().doc(folderId).update({"name": newName});
-                    if (!mounted || _isSignedOut() || _handledSignedOut) return;
-                    _showSuccessToast("Folder renamed.");
-                  } catch (e) {
-                    if (_isAuthOrPermissionError(e)) return;
-                    if (!mounted || _isSignedOut() || _handledSignedOut) return;
-                    _showErrorToast("Failed to rename folder.");
-                  }
-                },
+                onPressed: () => submitRename(dialogNavigator),
                 child: const Text("Save"),
               ),
             ],
@@ -1415,36 +1412,68 @@ class _FilesContentState extends State<_FilesContent> {
     }
   }
 
-  //delete folder recursively
-  Future<void> _deleteFolderRecursive(String folderId) async {
+  //gather every folder id and product doc inside a folder's subtree (read-only,
+  //nothing is deleted here yet)
+  Future<void> _collectFolderSubtree(
+      String folderId,
+      Set<String> folderIds,
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> products,
+      ) async {
+    folderIds.add(folderId);
+
     final itemsSnap = await _getQueryCacheThenServer(
       _productsRef().where("folderId", isEqualTo: folderId),
     );
+    products.addAll(itemsSnap.docs);
 
-    for (final item in itemsSnap.docs) {
-      // Delete the Firebase Storage image first, then the offline cache,
-      // then the Firestore product document.
+    final subsnap = await _getQueryCacheThenServer(
+      _foldersRef().where("parentId", isEqualTo: folderId),
+    );
+
+    for (final sub in subsnap.docs) {
+      await _collectFolderSubtree(sub.id, folderIds, products);
+    }
+  }
+
+  //delete folder recursively
+  Future<void> _deleteFolderRecursive(String folderId) async {
+    final folderIds = <String>{};
+    final products = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+
+    //first, figure out exactly what's being deleted without deleting anything
+    await _collectFolderSubtree(folderId, folderIds, products);
+
+    // Delete the Firebase Storage image and offline cache for every product
+    // first. These live outside Firestore, so cleaning them up before the
+    // documents disappear avoids leaving storage files with nothing pointing
+    // at them.
+    for (final item in products) {
       await _deleteProductStorageImage(item.id);
 
       await OfflineMediaService.instance.deleteOfflineImage(
         tenantId: widget.tenantId,
         productId: item.id,
       );
-
-      await item.reference.delete();
     }
 
-    //delete subfolders
-    final subsnap = await _getQueryCacheThenServer(
-      _foldersRef().where("parentId", isEqualTo: folderId),
-    );
+    // Delete every folder and product document in the subtree as a single
+    // atomic batch (chunked, since Firestore batches are capped at 500
+    // writes) so a failure can't leave some documents deleted and others
+    // still around.
+    final fs = FirebaseFirestore.instance;
+    final refs = <DocumentReference<Map<String, dynamic>>>[
+      for (final item in products) item.reference,
+      for (final id in folderIds) _foldersRef().doc(id),
+    ];
 
-    for (final sub in subsnap.docs) {
-      await _deleteFolderRecursive(sub.id);
+    const chunkSize = 400;
+    for (var i = 0; i < refs.length; i += chunkSize) {
+      final batch = fs.batch();
+      for (final ref in refs.skip(i).take(chunkSize)) {
+        batch.delete(ref);
+      }
+      await batch.commit();
     }
-
-    //delete current folder
-    await _foldersRef().doc(folderId).delete();
   }
 
   Future<void> _queueDeleteFolder(String folderId, String folderName) async {
@@ -1577,7 +1606,7 @@ class _FilesContentState extends State<_FilesContent> {
 
     //prefix search
     final start = q;
-    final end = "$start\uf8ff";
+    final end = "$start";
 
     final prefixQuery = _productsRef()
         .orderBy("code")
@@ -2126,6 +2155,9 @@ class _FilesContentState extends State<_FilesContent> {
 
   void _clearSearch() {
     _searchDebounce?.cancel();
+    // Invalidate any in-flight search so its results can't land after this
+    // clear and silently repopulate the (now empty) search UI.
+    _searchRequestToken++;
     _searchController.clear();
     _liveSearchQuery.value = "";
 

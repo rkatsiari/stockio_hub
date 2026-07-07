@@ -1,4 +1,4 @@
-//helper class for getting the currently signed-in user’s app data from Firestore
+//helper class for getting the currently signed-in user's app data from Firestore
 // and checking if that user still belongs to a valid tenant
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -66,7 +66,15 @@ class CurrentUserService {
         _db.collection('users').doc(firebaseUser.uid),
       );
 
-      if (doc == null || !doc.exists || doc.data() == null) {
+      if (doc == null) {
+        // Both the server and cache reads failed outright (e.g. no
+        // connectivity yet and nothing cached) - that's an availability
+        // problem, not proof the user/profile is invalid, so don't let
+        // callers treat this the same as "no such user".
+        throw Exception("Could not load your profile. Please try again.");
+      }
+
+      if (!doc.exists || doc.data() == null) {
         return null;
       }
 
@@ -89,7 +97,14 @@ class CurrentUserService {
         _db.collection('tenants').doc(tenantId),
       );
 
-      if (tenantDoc == null || !tenantDoc.exists) return false;
+      if (tenantDoc == null) {
+        // Couldn't reach the server or cache to check - don't report this
+        // as "invalid tenant", since that would incorrectly sign the user
+        // out over a connectivity hiccup rather than a real problem.
+        throw Exception("Could not verify your tenant. Please try again.");
+      }
+
+      if (!tenantDoc.exists) return false;
 
       final tenantData = tenantDoc.data() ?? <String, dynamic>{};
       final isActive = tenantData['isActive'];
@@ -104,7 +119,7 @@ class CurrentUserService {
     }
   }
 
-  //checks whether the user is actually listed inside the tenant’s users sub collection
+  //checks whether the user is actually listed inside the tenant's users sub collection
   Future<bool> existsInTenantUsers(AppUser user) async {
     try {
       if (!user.hasValidTenantId) return false;
@@ -117,7 +132,13 @@ class CurrentUserService {
             .doc(user.uid),
       );
 
-      return tenantUserDoc?.exists == true;
+      if (tenantUserDoc == null) {
+        // Same as above: an unreachable server/cache isn't proof of
+        // "not a member", so surface it as an error instead of false.
+        throw Exception("Could not verify your membership. Please try again.");
+      }
+
+      return tenantUserDoc.exists;
     } catch (e) {
       throw _normalizeError(e);
     }
