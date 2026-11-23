@@ -83,7 +83,7 @@ Set<String>? _parseVisibleShopIdsFromData(Map<String, dynamic> data) {
   if (!data.containsKey("visibleShopIds")) return null;
 
   final raw = data["visibleShopIds"];
-  if (raw == null) return <String>{};
+  if (raw == null) return null;
 
   if (raw is Iterable) {
     return raw
@@ -92,7 +92,7 @@ Set<String>? _parseVisibleShopIdsFromData(Map<String, dynamic> data) {
         .toSet();
   }
 
-  return <String>{};
+  return null;
 }
 
 Future<Set<String>?> _loadVisibleShopIdsForCurrentUser({
