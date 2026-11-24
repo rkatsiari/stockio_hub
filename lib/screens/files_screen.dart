@@ -1585,43 +1585,32 @@ class _FilesContentState extends State<_FilesContent> {
   }
 
   //search products by code
+
+// Search products by code (supports partial matches anywhere in the code)
   Future<List<QueryDocumentSnapshot<Map<String, dynamic>>>> _searchProductsByCode(
       String qRaw,
       ) async {
-    final q = qRaw.trim();
-    if (q.isEmpty) return <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+    final q = qRaw.trim().toLowerCase();
 
-    //uses map so exact and prefix result does not duplicate items
-    final Map<String, QueryDocumentSnapshot<Map<String, dynamic>>> map =
-    <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
-
-    final exactQuery = _productsRef().where("code", isEqualTo: q).limit(20); //find exact code matches
-
-    try { //add exact matches to map
-      final exactSnap = await _getQueryCacheThenServer(exactQuery);
-      for (final d in exactSnap.docs) {
-        map[d.id] = d;
-      }
-    } catch (_) {}
-
-    //prefix search
-    final start = q;
-    final end = "$start";
-
-    final prefixQuery = _productsRef()
-        .orderBy("code")
-        .startAt([start])
-        .endAt([end])
-        .limit(20);
-
-    final prefixSnap = await _getQueryCacheThenServer(prefixQuery);
-    for (final d in prefixSnap.docs) {
-      map[d.id] = d;
+    if (q.isEmpty) {
+      return <QueryDocumentSnapshot<Map<String, dynamic>>>[];
     }
 
-    //prefetch images and return only products inside visible folders
-    final results = map.values.where(_canSeeProductDoc).toList();
+    // Retrieve all products for this tenant, without a result limit.
+    final snap = await _getQueryCacheThenServer(_productsRef());
+
+    // Match the search text anywhere inside the product code.
+    final results = snap.docs.where((d) {
+      if (!_canSeeProductDoc(d)) return false;
+
+      final code = (d.data()["code"] ?? "").toString().toLowerCase();
+
+      return code.contains(q);
+    }).toList();
+
+    // Keep the existing image prefetch behaviour.
     await _prefetchProducts(results);
+
     return results;
   }
 
