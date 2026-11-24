@@ -79,6 +79,7 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Inventory Management',
       theme: ThemeData(
+        fontFamily: 'NotoSans',
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xff0B1E40),
         ),
@@ -87,6 +88,7 @@ class MyApp extends StatelessWidget {
           backgroundColor: Color(0xff0B1E40),
           iconTheme: IconThemeData(color: Colors.white),
           titleTextStyle: TextStyle(
+            fontFamily: 'NotoSans',
             color: Colors.white,
             fontSize: 20,
             fontWeight: FontWeight.w600,
