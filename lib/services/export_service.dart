@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -90,7 +89,6 @@ class ExportService {
   final ValueNotifier<ExportResult?> lastResult =
   ValueNotifier<ExportResult?>(null);
 
-  final Map<String, Uint8List?> _imageCache = {};
 
   bool get isExporting => stateNotifier.value.isExporting;
 
@@ -155,7 +153,6 @@ class ExportService {
     "1-2", "3-4", "5-6", "7-8", "9-10", "11-12",
   ];
 
-  static const int _picPx = 100;
   static const double _headerRowH = 28;
   static const double _normalRowH = 100;
   static const double _sizedItemRowH = 18;
@@ -238,6 +235,22 @@ class ExportService {
       addSize(size);
     }
 
+    // Shoe sizes are numeric, so always export them from smallest to largest.
+    // Keep the predefined order for T-shirt sizes.
+    if (type == "shoes") {
+      labels.sort((a, b) {
+        final aNumber = double.tryParse(a);
+        final bNumber = double.tryParse(b);
+
+        if (aNumber != null && bNumber != null) {
+          return aNumber.compareTo(bNumber);
+        }
+        if (aNumber != null) return -1;
+        if (bNumber != null) return 1;
+        return a.compareTo(b);
+      });
+    }
+
     return labels;
   }
 
@@ -279,35 +292,6 @@ class ExportService {
 
     return hasInternet;
   }
-
-  Future<Uint8List?> _downloadImageBytes(String url) async {
-    final clean = url.trim();
-    if (clean.isEmpty) return null;
-
-    if (_imageCache.containsKey(clean)) return _imageCache[clean];
-
-    final uri = Uri.tryParse(clean);
-    if (uri == null) {
-      //malformed URL - this will never succeed, so it's safe to remember
-      _imageCache[clean] = null;
-      return null;
-    }
-
-    try {
-      final resp = await http.get(uri).timeout(const Duration(seconds: 10));
-      if (resp.statusCode == 200 && resp.bodyBytes.isNotEmpty) {
-        _imageCache[clean] = resp.bodyBytes;
-        return resp.bodyBytes;
-      }
-    } catch (_) {}
-
-    //don't cache a network/timeout failure - it may be transient, and since
-    //this cache now lives on the singleton for the whole app session (not
-    //just one screen visit), permanently blacklisting an image here would
-    //mean it never loads again until the app is restarted
-    return null;
-  }
-
 
   Future<void> _shareFile({
     required String filename,
@@ -553,19 +537,9 @@ class ExportService {
       final productDocs = await Future.wait(
         productIds.map((id) => _productsCol(tenantId).doc(id).get()),
       );
-      _updateProgress(0.45, "Downloading product images...");
-
-      for (final pDoc in productDocs) {
-        final p = pDoc.data() ?? {};
-        final imageUrl = (p["imageUrl"] ?? "").toString().trim();
-        if (imageUrl.isNotEmpty) {
-          await _downloadImageBytes(imageUrl);
-        }
-      }
-
       String colDHeader = "Cost price";
       String colEHeader = "Retail price";
-      String Function(int) profitItemFormula = (row) => "=E$row-D$row";
+      String Function(int) profitItemFormula = (row) => "=D$row-C$row";
 
       switch (profitType) {
         case "storage":
@@ -591,7 +565,6 @@ class ExportService {
       _applyLandscape(sheet);
 
       final headers = [
-        "Image",
         "Code",
         "Qty sold",
         colDHeader,
@@ -606,13 +579,12 @@ class ExportService {
       _applyHeaderStyle(sheet, 1, 1, headers.length);
       sheet.getRangeByIndex(1, 1).rowHeight = _headerRowH;
 
-      sheet.getRangeByIndex(1, 1).columnWidth = 14;
-      sheet.getRangeByIndex(1, 2).columnWidth = 16;
-      sheet.getRangeByIndex(1, 3).columnWidth = 10;
+      sheet.getRangeByIndex(1, 1).columnWidth = 16;
+      sheet.getRangeByIndex(1, 2).columnWidth = 10;
+      sheet.getRangeByIndex(1, 3).columnWidth = 13;
       sheet.getRangeByIndex(1, 4).columnWidth = 13;
       sheet.getRangeByIndex(1, 5).columnWidth = 13;
       sheet.getRangeByIndex(1, 6).columnWidth = 13;
-      sheet.getRangeByIndex(1, 7).columnWidth = 13;
 
       final rows = <Map<String, dynamic>>[];
 
@@ -659,7 +631,6 @@ class ExportService {
           "colDValue": colDValue,
           "colEValue": colEValue,
           "profit": profit,
-          "imageUrl": (p["imageUrl"] ?? "").toString().trim(),
         });
       }
 
@@ -674,37 +645,27 @@ class ExportService {
       for (final r in rows) {
         sheet.getRangeByIndex(row, 1).rowHeight = _normalRowH;
 
-        sheet.getRangeByIndex(row, 2).setText((r["code"] ?? "").toString());
+        sheet.getRangeByIndex(row, 1).setText((r["code"] ?? "").toString());
 
-        final qtyCell = sheet.getRangeByIndex(row, 3);
+        final qtyCell = sheet.getRangeByIndex(row, 2);
         qtyCell.setNumber((r["qty"] as double));
         qtyCell.numberFormat = _qtyFmt;
 
-        final dCell = sheet.getRangeByIndex(row, 4);
+        final dCell = sheet.getRangeByIndex(row, 3);
         dCell.setNumber((r["colDValue"] as double));
         dCell.numberFormat = _euroFmt;
 
-        final eCell = sheet.getRangeByIndex(row, 5);
+        final eCell = sheet.getRangeByIndex(row, 4);
         eCell.setNumber((r["colEValue"] as double));
         eCell.numberFormat = _euroFmt;
 
-        final profitItemCell = sheet.getRangeByIndex(row, 6);
+        final profitItemCell = sheet.getRangeByIndex(row, 5);
         profitItemCell.setFormula(profitItemFormula(row));
         profitItemCell.numberFormat = _euroFmt;
 
-        final profitCell = sheet.getRangeByIndex(row, 7);
-        profitCell.setFormula("=F$row*C$row");
+        final profitCell = sheet.getRangeByIndex(row, 6);
+        profitCell.setFormula("=E$row*B$row");
         profitCell.numberFormat = _euroFmt;
-
-        final imageUrl = (r["imageUrl"] ?? "").toString();
-        if (imageUrl.isNotEmpty) {
-          final bytes = await _downloadImageBytes(imageUrl);
-          if (bytes != null && bytes.isNotEmpty) {
-            final pic = sheet.pictures.addStream(row, 1, bytes);
-            pic.width = _picPx;
-            pic.height = _picPx;
-          }
-        }
 
         productEndRows.add(row);
         row++;
@@ -713,24 +674,24 @@ class ExportService {
       final lastDataRow = row - 1;
       final totalsRow = lastDataRow + 2;
 
-      final labelCell = sheet.getRangeByIndex(totalsRow, 6);
+      final labelCell = sheet.getRangeByIndex(totalsRow, 5);
       labelCell.setText("TOTAL PROFIT");
       labelCell.cellStyle.bold = true;
       labelCell.cellStyle.hAlign = xlsio.HAlignType.right;
 
-      final totalProfitCell = sheet.getRangeByIndex(totalsRow, 7);
-      totalProfitCell.setFormula("=SUM(G2:G$lastDataRow)");
+      final totalProfitCell = sheet.getRangeByIndex(totalsRow, 6);
+      totalProfitCell.setFormula("=SUM(F2:F$lastDataRow)");
       totalProfitCell.numberFormat = _euroFmt;
       totalProfitCell.cellStyle.bold = true;
 
       if (lastDataRow >= 2) {
-        _applyTableBordersCenter(sheet, 1, 1, lastDataRow, 7);
+        _applyTableBordersCenter(sheet, 1, 1, lastDataRow, 6);
       }
-      _applyTableBordersCenter(sheet, totalsRow, 6, totalsRow, 7);
+      _applyTableBordersCenter(sheet, totalsRow, 5, totalsRow, 6);
 
       for (final rEnd in productEndRows) {
         if (rEnd >= 2 && rEnd <= lastDataRow) {
-          _applyProductSeparator(sheet, rEnd, 1, 7);
+          _applyProductSeparator(sheet, rEnd, 1, 6);
         }
       }
 
@@ -826,17 +787,6 @@ class ExportService {
         _setState(ExportJobState.idle);
         _announce(ExportResultType.info, "There are no products to export yet.");
         return;
-      }
-
-      _updateProgress(0.25, "Downloading product images...");
-
-      //preload product images
-      for (final p in products) {
-        final data = p.data();
-        final imageUrl = (data["imageUrl"] ?? "").toString().trim();
-        if (imageUrl.isNotEmpty) {
-          await _downloadImageBytes(imageUrl);
-        }
       }
 
       Query<Map<String, dynamic>> oq = _ordersCol(tenantId)
@@ -1022,7 +972,6 @@ class ExportService {
       _applyLandscape(sheet);
 
       final headers = [
-        "Image",
         "Code",
         "Size",
         "Opening qnty",
@@ -1042,16 +991,15 @@ class ExportService {
       sheet.getRangeByIndex(1, 1).rowHeight = _headerRowH;
 
       sheet.getRangeByIndex(1, 1).columnWidth = 14;
-      sheet.getRangeByIndex(1, 2).columnWidth = 14;
-      sheet.getRangeByIndex(1, 3).columnWidth = 10;
+      sheet.getRangeByIndex(1, 2).columnWidth = 10;
+      sheet.getRangeByIndex(1, 3).columnWidth = 12;
       sheet.getRangeByIndex(1, 4).columnWidth = 12;
-      sheet.getRangeByIndex(1, 5).columnWidth = 12;
-      sheet.getRangeByIndex(1, 6).columnWidth = 10;
-      sheet.getRangeByIndex(1, 7).columnWidth = 12;
-      sheet.getRangeByIndex(1, 8).columnWidth = 13;
-      sheet.getRangeByIndex(1, 9).columnWidth = 16;
-      sheet.getRangeByIndex(1, 10).columnWidth = 14;
-      sheet.getRangeByIndex(1, 11).columnWidth = 16;
+      sheet.getRangeByIndex(1, 5).columnWidth = 10;
+      sheet.getRangeByIndex(1, 6).columnWidth = 12;
+      sheet.getRangeByIndex(1, 7).columnWidth = 13;
+      sheet.getRangeByIndex(1, 8).columnWidth = 16;
+      sheet.getRangeByIndex(1, 9).columnWidth = 14;
+      sheet.getRangeByIndex(1, 10).columnWidth = 16;
 
       final rows = <Map<String, dynamic>>[];
 
@@ -1073,7 +1021,6 @@ class ExportService {
         final productId = p.id;
         final code = (pd["code"] ?? productId).toString().trim();
         final isSized = _isSizedProduct(pd);
-        final imageUrl = (pd["imageUrl"] ?? "").toString().trim();
 
         final cost = await PriceUtil.getPrice(fs, tenantId, productId, "cost");
         final wholesale = await PriceUtil.getPrice(fs, tenantId, productId, "wholesale");
@@ -1105,7 +1052,6 @@ class ExportService {
             "closing": closing,
             "cost": cost,
             "wholesale": wholesale,
-            "imageUrl": imageUrl,
             "sizeOrder": 0,
           });
         } else {
@@ -1129,7 +1075,6 @@ class ExportService {
               "closing": closingSz,
               "cost": cost,
               "wholesale": wholesale,
-              "imageUrl": imageUrl,
               "sizeOrder": sizeIndex,
             });
           }
@@ -1160,43 +1105,32 @@ class ExportService {
 
         if (!isSizedItem) {
           sheet.getRangeByIndex(row, 1).rowHeight = _normalRowH;
+          sheet.getRangeByIndex(row, 1).setText((r["code"] ?? "").toString());
+          sheet.getRangeByIndex(row, 2).setText("");
 
-          final imageUrl = (r["imageUrl"] ?? "").toString();
-          if (imageUrl.isNotEmpty) {
-            final bytes = await _downloadImageBytes(imageUrl);
-            if (bytes != null && bytes.isNotEmpty) {
-              final pic = sheet.pictures.addStream(row, 1, bytes);
-              pic.width = _picPx;
-              pic.height = _picPx;
-            }
-          }
-
-          sheet.getRangeByIndex(row, 2).setText((r["code"] ?? "").toString());
-          sheet.getRangeByIndex(row, 3).setText("");
-
-          for (final col in [4, 5, 6, 7]) {
+          for (final col in [3, 4, 5, 6]) {
             sheet.getRangeByIndex(row, col).numberFormat = _qtyFmt;
           }
 
-          sheet.getRangeByIndex(row, 4).setNumber((r["opening"] as double));
-          sheet.getRangeByIndex(row, 5).setNumber((r["added"] as double));
-          sheet.getRangeByIndex(row, 6).setNumber((r["sold"] as double));
-          sheet.getRangeByIndex(row, 7).setNumber((r["closing"] as double));
+          sheet.getRangeByIndex(row, 3).setNumber((r["opening"] as double));
+          sheet.getRangeByIndex(row, 4).setNumber((r["added"] as double));
+          sheet.getRangeByIndex(row, 5).setNumber((r["sold"] as double));
+          sheet.getRangeByIndex(row, 6).setNumber((r["closing"] as double));
 
-          final costCell = sheet.getRangeByIndex(row, 8);
+          final costCell = sheet.getRangeByIndex(row, 7);
           costCell.setNumber((r["cost"] as double));
           costCell.numberFormat = _euroFmt;
 
-          final whCell = sheet.getRangeByIndex(row, 9);
+          final whCell = sheet.getRangeByIndex(row, 8);
           whCell.setNumber((r["wholesale"] as double));
           whCell.numberFormat = _euroFmt;
 
-          final totalCostCell = sheet.getRangeByIndex(row, 10);
-          totalCostCell.setFormula("=G$row*H$row");
+          final totalCostCell = sheet.getRangeByIndex(row, 9);
+          totalCostCell.setFormula("=F$row*G$row");
           totalCostCell.numberFormat = _euroFmt;
 
-          final totalWholesaleCell = sheet.getRangeByIndex(row, 11);
-          totalWholesaleCell.setFormula("=G$row*I$row");
+          final totalWholesaleCell = sheet.getRangeByIndex(row, 10);
+          totalWholesaleCell.setFormula("=F$row*H$row");
           totalWholesaleCell.numberFormat = _euroFmt;
 
           productEndRows.add(row);
@@ -1220,18 +1154,14 @@ class ExportService {
         }
 
         final endRow = startRow + block.length - 1;
-        final fitPhotoRowHeight = _picPx / block.length;
         final sizedRowHeight = block.length == 1
             ? _normalRowH
-            : (fitPhotoRowHeight > _sizedItemRowH
-            ? fitPhotoRowHeight
-            : _sizedItemRowH);
+            : _sizedItemRowH;
 
         for (int rr = startRow; rr <= endRow; rr++) {
           sheet.getRangeByIndex(rr, 1).rowHeight = sizedRowHeight;
         }
 
-        xlsio.Range imgRange;
         xlsio.Range codeRange;
         xlsio.Range costRange;
         xlsio.Range whRange;
@@ -1239,23 +1169,20 @@ class ExportService {
         xlsio.Range totalWhRange;
 
         if (endRow > startRow) {
-          imgRange = sheet.getRangeByIndex(startRow, 1, endRow, 1)..merge();
-          codeRange = sheet.getRangeByIndex(startRow, 2, endRow, 2)..merge();
-          costRange = sheet.getRangeByIndex(startRow, 8, endRow, 8)..merge();
-          whRange = sheet.getRangeByIndex(startRow, 9, endRow, 9)..merge();
-          totalCostRange = sheet.getRangeByIndex(startRow, 10, endRow, 10)..merge();
-          totalWhRange = sheet.getRangeByIndex(startRow, 11, endRow, 11)..merge();
+          codeRange = sheet.getRangeByIndex(startRow, 1, endRow, 1)..merge();
+          costRange = sheet.getRangeByIndex(startRow, 7, endRow, 7)..merge();
+          whRange = sheet.getRangeByIndex(startRow, 8, endRow, 8)..merge();
+          totalCostRange = sheet.getRangeByIndex(startRow, 9, endRow, 9)..merge();
+          totalWhRange = sheet.getRangeByIndex(startRow, 10, endRow, 10)..merge();
         } else {
-          imgRange = sheet.getRangeByIndex(startRow, 1);
-          codeRange = sheet.getRangeByIndex(startRow, 2);
-          costRange = sheet.getRangeByIndex(startRow, 8);
-          whRange = sheet.getRangeByIndex(startRow, 9);
-          totalCostRange = sheet.getRangeByIndex(startRow, 10);
-          totalWhRange = sheet.getRangeByIndex(startRow, 11);
+          codeRange = sheet.getRangeByIndex(startRow, 1);
+          costRange = sheet.getRangeByIndex(startRow, 7);
+          whRange = sheet.getRangeByIndex(startRow, 8);
+          totalCostRange = sheet.getRangeByIndex(startRow, 9);
+          totalWhRange = sheet.getRangeByIndex(startRow, 10);
         }
 
         for (final rng in [
-          imgRange,
           codeRange,
           costRange,
           whRange,
@@ -1266,49 +1193,38 @@ class ExportService {
           rng.cellStyle.hAlign = xlsio.HAlignType.center;
         }
 
-        final imageUrl = (block.first["imageUrl"] ?? "").toString();
-        if (imageUrl.isNotEmpty) {
-          final bytes = await _downloadImageBytes(imageUrl);
-          if (bytes != null && bytes.isNotEmpty) {
-            final anchorRow = startRow + ((block.length - 1) ~/ 2);
-            final pic = sheet.pictures.addStream(anchorRow, 1, bytes);
-            pic.width = _picPx;
-            pic.height = _picPx;
-          }
-        }
-
         sheet
-            .getRangeByIndex(startRow, 2)
+            .getRangeByIndex(startRow, 1)
             .setText((block.first["code"] ?? "").toString());
 
-        final costCell = sheet.getRangeByIndex(startRow, 8);
+        final costCell = sheet.getRangeByIndex(startRow, 7);
         costCell.setNumber((block.first["cost"] as double));
         costCell.numberFormat = _euroFmt;
 
-        final whCell = sheet.getRangeByIndex(startRow, 9);
+        final whCell = sheet.getRangeByIndex(startRow, 8);
         whCell.setNumber((block.first["wholesale"] as double));
         whCell.numberFormat = _euroFmt;
 
-        final jCell = sheet.getRangeByIndex(startRow, 10);
-        jCell.setFormula("=SUM(G$startRow:G$endRow)*H$startRow");
+        final jCell = sheet.getRangeByIndex(startRow, 9);
+        jCell.setFormula("=SUM(F$startRow:F$endRow)*G$startRow");
         jCell.numberFormat = _euroFmt;
 
-        final kCell = sheet.getRangeByIndex(startRow, 11);
-        kCell.setFormula("=SUM(G$startRow:G$endRow)*I$startRow");
+        final kCell = sheet.getRangeByIndex(startRow, 10);
+        kCell.setFormula("=SUM(F$startRow:F$endRow)*H$startRow");
         kCell.numberFormat = _euroFmt;
 
         int rr = startRow;
         for (final line in block) {
-          sheet.getRangeByIndex(rr, 3).setText((line["size"] ?? "").toString());
+          sheet.getRangeByIndex(rr, 2).setText((line["size"] ?? "").toString());
 
-          for (final col in [4, 5, 6, 7]) {
+          for (final col in [3, 4, 5, 6]) {
             sheet.getRangeByIndex(rr, col).numberFormat = _qtyFmt;
           }
 
-          sheet.getRangeByIndex(rr, 4).setNumber((line["opening"] as double));
-          sheet.getRangeByIndex(rr, 5).setNumber((line["added"] as double));
-          sheet.getRangeByIndex(rr, 6).setNumber((line["sold"] as double));
-          sheet.getRangeByIndex(rr, 7).setNumber((line["closing"] as double));
+          sheet.getRangeByIndex(rr, 3).setNumber((line["opening"] as double));
+          sheet.getRangeByIndex(rr, 4).setNumber((line["added"] as double));
+          sheet.getRangeByIndex(rr, 5).setNumber((line["sold"] as double));
+          sheet.getRangeByIndex(rr, 6).setNumber((line["closing"] as double));
 
           rr++;
         }
@@ -1320,40 +1236,40 @@ class ExportService {
       final lastDataRow = row - 1;
 
       final totalsRow = lastDataRow + 3;
-      sheet.getRangeByIndex(totalsRow, 2).setText("TOTALS");
-      sheet.getRangeByIndex(totalsRow, 2).cellStyle.bold = true;
-      sheet.getRangeByIndex(totalsRow, 2).cellStyle.hAlign =
+      sheet.getRangeByIndex(totalsRow, 1).setText("TOTALS");
+      sheet.getRangeByIndex(totalsRow, 1).cellStyle.bold = true;
+      sheet.getRangeByIndex(totalsRow, 1).cellStyle.hAlign =
           xlsio.HAlignType.right;
 
+      sheet.getRangeByIndex(totalsRow, 3).setFormula("=SUM(C2:C$lastDataRow)");
       sheet.getRangeByIndex(totalsRow, 4).setFormula("=SUM(D2:D$lastDataRow)");
       sheet.getRangeByIndex(totalsRow, 5).setFormula("=SUM(E2:E$lastDataRow)");
       sheet.getRangeByIndex(totalsRow, 6).setFormula("=SUM(F2:F$lastDataRow)");
-      sheet.getRangeByIndex(totalsRow, 7).setFormula("=SUM(G2:G$lastDataRow)");
 
-      for (final col in [4, 5, 6, 7]) {
+      for (final col in [3, 4, 5, 6]) {
         final c = sheet.getRangeByIndex(totalsRow, col);
         c.numberFormat = _qtyFmt;
         c.cellStyle.bold = true;
       }
 
-      final totalCostAll = sheet.getRangeByIndex(totalsRow, 10);
-      totalCostAll.setFormula("=SUM(J2:J$lastDataRow)");
+      final totalCostAll = sheet.getRangeByIndex(totalsRow, 9);
+      totalCostAll.setFormula("=SUM(I2:I$lastDataRow)");
       totalCostAll.numberFormat = _euroFmt;
       totalCostAll.cellStyle.bold = true;
 
-      final totalWholesaleAll = sheet.getRangeByIndex(totalsRow, 11);
-      totalWholesaleAll.setFormula("=SUM(K2:K$lastDataRow)");
+      final totalWholesaleAll = sheet.getRangeByIndex(totalsRow, 10);
+      totalWholesaleAll.setFormula("=SUM(J2:J$lastDataRow)");
       totalWholesaleAll.numberFormat = _euroFmt;
       totalWholesaleAll.cellStyle.bold = true;
 
       if (lastDataRow >= 2) {
-        _applyTableBordersCenter(sheet, 1, 1, lastDataRow, 11);
+        _applyTableBordersCenter(sheet, 1, 1, lastDataRow, 10);
       }
-      _applyTableBordersCenter(sheet, totalsRow, 2, totalsRow, 11);
+      _applyTableBordersCenter(sheet, totalsRow, 1, totalsRow, 10);
 
       for (final rEnd in productEndRows) {
         if (rEnd >= 2 && rEnd <= lastDataRow) {
-          _applyProductSeparator(sheet, rEnd, 1, 11);
+          _applyProductSeparator(sheet, rEnd, 1, 10);
         }
       }
 
