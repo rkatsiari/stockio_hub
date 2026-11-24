@@ -12,6 +12,7 @@ import 'package:syncfusion_flutter_xlsio/xlsio.dart' as xlsio;
 import '../utils/price_util.dart';
 import '../widgets/top_toast.dart';
 import 'app_navigation.dart';
+import 'dart:ui' show Rect;
 
 /// Snapshot of what ExportService is currently doing. Any screen can listen
 /// to [ExportService.stateNotifier] via a ValueListenableBuilder and see the
@@ -307,15 +308,16 @@ class ExportService {
     return null;
   }
 
+
   Future<void> _shareFile({
     required String filename,
     required List<int> bytes,
     required String shareText,
   }) async {
-    //clean up temp export folders left behind by earlier exports so they
-    //don't accumulate in app storage over time
+    // Clean up temporary export folders from previous exports.
     try {
       final entries = Directory.systemTemp.listSync();
+
       for (final entity in entries) {
         if (entity is Directory && entity.path.contains("ims_exports_")) {
           try {
@@ -325,12 +327,27 @@ class ExportService {
       }
     } catch (_) {}
 
+    // Create the Excel file in temporary storage.
     final dir = await Directory.systemTemp.createTemp("ims_exports_");
     final file = File("${dir.path}/$filename");
+
     await file.writeAsBytes(bytes, flush: true);
 
-    await Share.shareXFiles([XFile(file.path)], text: shareText);
+    // Open the native share sheet.
+    await Share.shareXFiles(
+      [
+        XFile(
+          file.path,
+          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ),
+      ],
+      text: shareText,
+
+      // iOS share-sheet workaround.
+      sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
+    );
   }
+//here above
 
   //normalizes the selected export shop name into a display string and a
   //filesystem-safe filename fragment (shared by both export methods)

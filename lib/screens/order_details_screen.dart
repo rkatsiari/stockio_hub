@@ -1478,15 +1478,29 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
 
       bool shouldMarkExported = true;
 
+
       if (share) {
-        await Share.shareXFiles([XFile(file.path)], text: "Order: $orderName");
+        await Share.shareXFiles(
+          [
+            XFile(
+              file.path,
+              mimeType: 'application/pdf',
+            ),
+          ],
+          text: "Order: $orderName",
+
+          // Workaround for the iOS 26 share sheet issue.
+          sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
+        );
 
         if (!mounted || _isLeavingScreen) return;
+
         _unfocusSafely();
 
         final confirmed = await _showConfirmExportDialog();
         shouldMarkExported = confirmed == true;
       }
+//here above
 
       if (!shouldMarkExported) {
         _toastRed("Export canceled. Order not sent.");
