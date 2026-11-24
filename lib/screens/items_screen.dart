@@ -566,6 +566,7 @@ class _ItemsContentState extends State<_ItemsContent> {
 
   bool _foldersErrorShown = false;
   bool _itemsErrorShown = false;
+  bool _isOutOfStockFolder = false;
 
   //role helpers
   bool get _isAdmin => widget.role == "admin";
@@ -591,6 +592,7 @@ class _ItemsContentState extends State<_ItemsContent> {
   @override
   void initState() {
     super.initState();
+    unawaited(_loadOutOfStockFolderStatus());
     _authSub = FirebaseAuth.instance.authStateChanges().listen((user) {
       if (!mounted || _handledSignedOut) return;
       if (user == null) {
@@ -741,6 +743,21 @@ class _ItemsContentState extends State<_ItemsContent> {
       return _isProtectedFolder(data);
     } catch (_) {
       return false;
+    }
+  }
+
+  Future<void> _loadOutOfStockFolderStatus() async {
+    try {
+      final snap = await _tryGetDocCacheThenServer(
+        _foldersCol().doc(widget.folderId),
+      );
+      final data = snap?.data() ?? <String, dynamic>{};
+      final isOutOfStock =
+          (data["systemType"] ?? "").toString().trim() == "out_of_stock";
+      if (!mounted || _isOutOfStockFolder == isOutOfStock) return;
+      setState(() => _isOutOfStockFolder = isOutOfStock);
+    } catch (_) {
+      // Keep the normal item-card controls if folder metadata cannot be read.
     }
   }
 
@@ -2464,6 +2481,7 @@ class _ItemsContentState extends State<_ItemsContent> {
                 initialIndex: index,
                 isAdmin: _isAdmin,
                 canCreateOrders: _canCreateOrders && !_isStorageManager,
+                isOutOfStockFolder: _isOutOfStockFolder,
                 sizes: _sizes,
                 selectionMode: _isSelectionMode,
                 isSelected: _selectedProductIds.contains(id),
@@ -2667,6 +2685,7 @@ class _ItemCard extends StatefulWidget {
   final int initialIndex;
   final bool isAdmin;
   final bool canCreateOrders;
+  final bool isOutOfStockFolder;
   final List<String> sizes;
   final bool selectionMode;
   final bool isSelected;
@@ -2688,6 +2707,7 @@ class _ItemCard extends StatefulWidget {
     required this.initialIndex,
     required this.isAdmin,
     required this.canCreateOrders,
+    required this.isOutOfStockFolder,
     required this.sizes,
     required this.selectionMode,
     required this.isSelected,
@@ -3160,7 +3180,7 @@ class _ItemCardState extends State<_ItemCard> {
                   ],
                 ),
               ),
-              if (widget.canCreateOrders)
+              if (widget.canCreateOrders && !widget.isOutOfStockFolder)
                 StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
                   stream: yearDocStream,
                   builder: (context, snap) {
@@ -3184,7 +3204,7 @@ class _ItemCardState extends State<_ItemCard> {
                     );
                   },
                 )
-              else
+              else if (!widget.isOutOfStockFolder)
                 const SizedBox(height: 46),
             ],
           ),
