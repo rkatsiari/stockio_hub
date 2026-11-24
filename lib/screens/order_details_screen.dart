@@ -1115,6 +1115,21 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         enrichedItems.add(data);
       }
 
+      double totalWholesale = 0;
+
+      for (final item in enrichedItems) {
+        final qty = _toInt(item["qty"] ?? 0);
+        final rawPrice = item["wholesalePrice"];
+
+        final price = rawPrice is num
+            ? rawPrice.toDouble()
+            : double.tryParse(rawPrice?.toString() ?? "");
+
+        if (price != null) {
+          totalWholesale += qty * price;
+        }
+      }
+
       final tree = _buildTreeFromMaps(enrichedItems);
       final List<_PdfSection> sections = [];
 
@@ -1413,7 +1428,8 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         );
       }
 
-      for (final page in pages) {
+      for (int pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+        final page = pages[pageIndex];
         pdf.addPage(
           pw.Page(
             pageFormat: pageFormat,
@@ -1462,6 +1478,27 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                       ],
                     ),
                   ),
+                  if (pageIndex == pages.length - 1) ...[
+                    pw.SizedBox(height: 10),
+                    pw.Divider(
+                      thickness: 1,
+                      color: PdfColors.blueGrey700,
+                    ),
+                    pw.Row(
+                      mainAxisAlignment: pw.MainAxisAlignment.end,
+                      children: [
+                        pw.Text("Total Wholesale:", style: boldText),
+                        pw.SizedBox(width: 12),
+                        pw.Text(
+                          totalWholesale.toStringAsFixed(2),
+                          style: pw.TextStyle(
+                            font: fontBold,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
               );
             },
